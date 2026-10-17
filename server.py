@@ -30,6 +30,7 @@ HOST = os.environ.get("TABLE_OCR_HOST", "0.0.0.0" if "--lan" in sys.argv else "1
 PORT = int(os.environ.get("TABLE_OCR_PORT", "8765"))
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("TABLE_OCR_MODEL", "qwen2.5vl:7b")
+TRANSLATE_MODEL = os.environ.get("TABLE_OCR_TRANSLATE_MODEL", "translategemma:12b")
 WSL_DISTRO = os.environ.get("TABLE_OCR_WSL_DISTRO", "")  # "" = default distro
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -155,6 +156,91 @@ def render_crop(doc, page_no, rect_frac):
     return pix.tobytes("png")
 
 
+# ------------------------------------------------------------- translation --
+
+# code -> (name used in the prompt, label shown in the UI)
+LANGUAGES = {
+    "ur": ("Urdu", "Urdu"),
+    "pa-Arab": ("Punjabi", "Punjabi (Shahmukhi)"),
+    "pa-Guru": ("Punjabi", "Punjabi (Gurmukhi)"),
+    "sd-Arab": ("Sindhi", "Sindhi"),
+    "en": ("English", "English"),
+}
+# Letters used in Sindhi but not in Urdu / Shahmukhi Punjabi.
+SINDHI_LETTERS = set("ٻٽٿڀڃڄڇڊڌڍڏڙڦڪڳڱ")
+PUNJABI_WORDS = {"دا", "دی", "دے", "نوں", "وچ", "توں", "تے", "ایہہ", "اوہ", "سی", "ہیگا", "کیہ", "جی", "اسیں", "تسیں"}
+URDU_WORDS = {"کا", "کی", "کے", "کو", "میں", "سے", "ہے", "ہیں", "تھا", "یہ", "وہ", "اور", "نے"}
+
+
+def detect_language(text):
+    if re.search(r"[਀-੿]", text):
+        return "pa-Guru"
+    if any(ch in SINDHI_LETTERS for ch in text):
+        return "sd-Arab"
+    if not re.search(r"[؀-ۿ]", text):
+        return "en"
+    # Shahmukhi Punjabi shares Urdu's letters; tell them apart by common grammar words.
+    words = re.findall(r"[؀-ۿݐ-ݿ]+", text)
+    punjabi = sum(w in PUNJABI_WORDS for w in words) + 3 * text.count("ݨ")
+    urdu = sum(w in URDU_WORDS for w in words)
+    return "pa-Arab" if punjabi >= 2 and punjabi > urdu else "ur"
+
+
+def translate_prompt(src, tgt, text):
+    s_name, t_name = LANGUAGES[src][0], LANGUAGES[tgt][0]
+    # Prompt format TranslateGemma was trained on (two blank lines before the text).
+    return (f"You are a professional {s_name} ({src}) to {t_name} ({tgt}) translator. "
+            f"Your goal is to accurately convey the meaning and nuances of the original {s_name} text "
+            f"while adhering to {t_name} grammar, vocabulary, and cultural sensitivities.\n"
+            f"Produce only the {t_name} translation, without any additional explanations or commentary. "
+            f"Please translate the following {s_name} text into {t_name}:\n\n\n{text}")
+
+
+# Reading and translating an image in one step makes the model invent content, so selections are
+# transcribed first (it reads Urdu/Sindhi script well) and the text is then translated normally.
+def transcribe_prompt(src):
+    s_name = LANGUAGES[src][1] if src in LANGUAGES else "Urdu, Punjabi (Shahmukhi or Gurmukhi) or Sindhi"
+    return (f"Transcribe all text in this image exactly as written, in its original script and language "
+            f"(it may be {s_name}). Do not translate. Keep line and paragraph breaks. "
+            f"Output only the transcribed text.")
+
+
+def clean_transcription(text):
+    text = re.sub(r"</?(start|end)_of_image>", "", text)
+    lines = text.strip().splitlines()
+    # The model sometimes prefixes a bare language label ("Punjabi") on its own line.
+    if lines and lines[0].strip().lower() in {"urdu", "punjabi", "sindhi", "shahmukhi", "gurmukhi"}:
+        lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+def chunk_text(text, limit=1500):
+    """Split on paragraph (then sentence) boundaries so each request stays well inside the model's comfort zone."""
+    chunks, cur = [], ""
+    for para in re.split(r"\n\s*\n", text.strip()):
+        pieces = [para] if len(para) <= limit else re.split(r"(?<=[.!?۔؟])\s+", para)
+        for piece in pieces:
+            if cur and len(cur) + len(piece) + 2 > limit:
+                chunks.append(cur)
+                cur = ""
+            cur = f"{cur}\n\n{piece}" if cur else piece
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def ollama_generate(model, prompt, image=None):
+    msg = {"role": "user", "content": prompt}
+    if image:
+        msg["images"] = [base64.b64encode(image).decode()]
+    res = ollama_request("/api/chat", {
+        "model": model, "stream": False, "keep_alive": "15m",
+        "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 4096},
+        "messages": [msg],
+    }, timeout=900)
+    return res.get("message", {}).get("content", "").strip()
+
+
 # ------------------------------------------------------------ excel export --
 
 NUM_RE = re.compile(r"^\(?-?[$€£]?\s?\d{1,3}(,\d{3})*(\.\d+)?\)?%?$|^\(?-?[$€£]?\s?\d+(\.\d+)?\)?%?$")
@@ -264,9 +350,11 @@ class Handler(BaseHTTPRequestHandler):
                     tags = ollama_request("/api/tags", timeout=5)
                 except Exception as e:
                     return self.send(200, {"ok": False, "error": f"Ollama not reachable at {OLLAMA}: {e}",
-                                           "models": [], "default": DEFAULT_MODEL})
+                                           "models": [], "default": DEFAULT_MODEL,
+                                           "translate_default": TRANSLATE_MODEL})
                 names = [m["name"] for m in tags.get("models", [])]
-                return self.send(200, {"ok": True, "models": names, "default": DEFAULT_MODEL})
+                return self.send(200, {"ok": True, "models": names, "default": DEFAULT_MODEL,
+                                       "translate_default": TRANSLATE_MODEL})
             if url.path == "/api/page":
                 doc = self.get_doc(q["id"])
                 with DOCS_LOCK:
@@ -312,6 +400,32 @@ class Handler(BaseHTTPRequestHandler):
                                            "raw": text})
                 return self.send(200, {"ok": True, "rows": rows, "seconds": round(time.time() - t0, 1),
                                        "model": model})
+
+            if url.path == "/api/translate":
+                req = json.loads(self.body())
+                model = req.get("model") or TRANSLATE_MODEL
+                tgt = req.get("target") or "en"
+                src = req.get("source") or "auto"
+                t0 = time.time()
+                if req.get("rect"):  # selected region of the page: transcribe first, then translate
+                    doc = self.get_doc(req["id"])
+                    with DOCS_LOCK:
+                        png = render_crop(doc, int(req["page"]), req["rect"])
+                    text = clean_transcription(ollama_generate(model, transcribe_prompt(src), png))
+                    if not text:
+                        return self.send(200, {"ok": False, "error": "No text found in the selection."})
+                else:
+                    text = (req.get("text") or "").strip()
+                    if not text:
+                        return self.send(200, {"ok": False, "error": "Nothing to translate."})
+                if src == "auto":
+                    src = detect_language(text)
+                if src == tgt:
+                    return self.send(200, {"ok": False, "original": text,
+                                           "error": f"Text looks like {LANGUAGES[src][1]} already - pick the source language."})
+                out = "\n\n".join(ollama_generate(model, translate_prompt(src, tgt, c)) for c in chunk_text(text))
+                return self.send(200, {"ok": True, "translation": out, "original": text, "source": src,
+                                       "seconds": round(time.time() - t0, 1), "model": model})
 
             if url.path == "/api/export":
                 req = json.loads(self.body())

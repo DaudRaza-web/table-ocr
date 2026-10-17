@@ -15,6 +15,10 @@ Fix any cells, add a title, then download as `.xlsx`. Nothing leaves your machin
 - Optional table title, placed above the table in the spreadsheet
 - `.xlsx` export with real numbers (`12,450`, `12.3%`, `$1,200.50`, `(9,870)` keep their formatting), or copy as tab-separated text to paste into Excel
 - Optional LAN mode so other devices on your network can use it
+- **Translate tab**: Urdu, Punjabi (Shahmukhi and Gurmukhi) and Sindhi to English, using
+  [TranslateGemma](https://ollama.com/library/translategemma) 12B. Paste text, or select a region of the page:
+  it's transcribed into an editable "Original text" box first, so you can fix reading errors, then translated.
+  The source language is auto-detected (Sindhi-only letters, Gurmukhi script, common Punjabi words).
 
 ## Requirements
 
@@ -27,7 +31,10 @@ Pull the model once (the only step that needs internet besides installing the Py
 
 ```bash
 ollama pull qwen2.5vl:7b
+ollama pull translategemma:12b   # for the Translate tab (~8 GB, needs ~10 GB VRAM)
 ```
+
+If a pull stalls near the end, restart Ollama (`sudo systemctl restart ollama`) and pull again — it resumes.
 
 Other vision models in Ollama (e.g. `granite3.2-vision`, `qwen3-vl`, `llama3.2-vision`) show up in the model dropdown.
 
@@ -63,7 +70,8 @@ LAN mode has no authentication: anyone on your network can use the tool while it
 | --- | --- | --- |
 | `TABLE_OCR_PORT` | `8765` | Port the web UI listens on |
 | `TABLE_OCR_HOST` | `127.0.0.1` (`0.0.0.0` with `--lan`) | Interface to listen on |
-| `TABLE_OCR_MODEL` | `qwen2.5vl:7b` | Model selected by default |
+| `TABLE_OCR_MODEL` | `qwen2.5vl:7b` | Table extraction model selected by default |
+| `TABLE_OCR_TRANSLATE_MODEL` | `translategemma:12b` | Translation model selected by default |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama endpoint |
 | `TABLE_OCR_WSL_DISTRO` | default distro | WSL distro to start Ollama in |
 

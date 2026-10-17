@@ -46,17 +46,32 @@
   .hint { color: var(--muted); font-size: 12px; padding: 0 10px 8px; }
   #spinner { display: none; width: 14px; height: 14px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .tabs { display: flex; gap: 2px; background: var(--bg); padding: 3px; border-radius: 8px; border: 1px solid var(--line); }
+  .tabs button { border: 0; background: transparent; padding: 5px 12px; }
+  .tabs button.active { background: var(--panel); box-shadow: 0 1px 3px rgba(0,0,0,.15); font-weight: 600; }
+  [hidden] { display: none !important; }
+  .muted { color: var(--muted); font-weight: 400; }
+  .tx { flex: 1; display: flex; flex-direction: column; gap: 8px; padding: 12px; min-height: 0; }
+  .tx > label, .tx .row label { font-weight: 600; }
+  .tx .row { display: flex; gap: 8px; align-items: center; }
+  textarea { flex: 1; min-height: 140px; width: 100%; resize: vertical; font: 15px/1.6 system-ui, "Segoe UI", sans-serif; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; }
+  textarea.rtl { font-family: "Noto Nastaliq Urdu", "Jameel Noori Nastaleeq", "Urdu Typesetting", "Segoe UI", system-ui, sans-serif; font-size: 20px; line-height: 2; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; grid-auto-rows: minmax(420px, auto); } body { height: auto; } }
 </style>
 </head>
 <body>
 <header>
   <h1>Table OCR</h1>
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="table" class="active">Table → Excel</button>
+    <button role="tab" data-tab="translate">Translate</button>
+  </nav>
   <button class="primary" id="openBtn">Open image / PDF</button>
   <input type="file" id="file" accept=".pdf,image/*" hidden>
   <span id="fname" style="color:var(--muted)"></span>
   <span class="spacer"></span>
-  <label style="color:var(--muted)">Model <select id="model"></select></label>
+  <label style="color:var(--muted)" class="for-table">Model <select id="model"></select></label>
+  <label style="color:var(--muted)" class="for-translate" hidden>Model <select id="tModel"></select></label>
   <span id="spinner"></span>
   <span id="status">Starting…</span>
 </header>
@@ -74,19 +89,52 @@
       <button id="fit">Fit</button>
     </div>
     <div class="bar">
-      <button class="primary" id="extract" disabled>Extract table</button>
-      <label><input type="radio" name="mode" value="replace" checked> Replace</label>
-      <label title="Add rows to the current table (e.g. a table that continues on the next page)"><input type="radio" name="mode" value="append"> Append rows</label>
+      <button class="primary for-table" id="extract" disabled>Extract table</button>
+      <label class="for-table"><input type="radio" name="mode" value="replace" checked> Replace</label>
+      <label class="for-table" title="Add rows to the current table (e.g. a table that continues on the next page)"><input type="radio" name="mode" value="append"> Append rows</label>
+      <button class="primary for-translate" id="translateSel" disabled hidden>Translate selection</button>
+      <label class="for-translate" hidden title="Add each translated selection below the previous one"><input type="checkbox" id="appendOut" checked> Add to output</label>
       <button id="clearSel" disabled>Clear selection</button>
     </div>
-    <div class="hint">Drag over the page to select the table region.</div>
+    <div class="hint for-table">Drag over the page to select the table region.</div>
+    <div class="hint for-translate" hidden>Drag over the page to select text. It is transcribed into “Original text” (fix any errors there), then translated. A paragraph or column at a time works best.</div>
     <div id="viewer">
       <div id="empty">Open or drop an image / PDF to begin.</div>
       <div id="stage" hidden><img id="pageImg" alt="page" draggable="false"><div id="selbox"></div></div>
     </div>
   </section>
 
-  <section class="pane">
+  <section class="pane for-translate" id="translatePane" hidden>
+    <div class="bar">
+      <label>From <select id="srcLang">
+        <option value="auto">Auto-detect</option>
+        <option value="ur">Urdu</option>
+        <option value="pa-Arab">Punjabi (Shahmukhi)</option>
+        <option value="pa-Guru">Punjabi (Gurmukhi)</option>
+        <option value="sd-Arab">Sindhi</option>
+      </select></label>
+      <label>To <select id="tgtLang">
+        <option value="en">English</option>
+        <option value="ur">Urdu</option>
+      </select></label>
+      <span class="spacer"></span>
+      <button class="primary" id="translateText">Translate text</button>
+    </div>
+    <div class="tx">
+      <label for="srcText">Original text <span class="muted">— type or paste, or select a region on the page instead</span></label>
+      <textarea id="srcText" dir="auto" class="rtl" placeholder="یہاں اردو، پنجابی یا سندھی متن لکھیں یا چسپاں کریں…"></textarea>
+      <div class="row">
+        <label for="outText">Translation <span class="muted">— editable</span></label>
+        <span class="spacer"></span>
+        <button id="clearOut">Clear</button>
+        <button id="copyOut">Copy</button>
+        <button id="saveOut">Download .txt</button>
+      </div>
+      <textarea id="outText" dir="auto" placeholder="The translation appears here."></textarea>
+    </div>
+  </section>
+
+  <section class="pane for-table" id="tablePane">
     <div class="bar">
       <button id="addRow" title="Insert row below the selected cell">+ Row</button>
       <button id="delRow">− Row</button>
@@ -106,7 +154,7 @@
 
 <script>
 const $ = s => document.querySelector(s);
-const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, rows: [], cur: [0, 0], busy: false };
+const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, rows: [], cur: [0, 0], busy: false, tab: 'table' };
 
 function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
 function busy(on) { state.busy = on; $('#spinner').style.display = on ? 'inline-block' : 'none'; refreshButtons(); }
@@ -127,11 +175,31 @@ async function loadModels() {
   const list = vision.length ? vision : j.models;
   list.forEach(m => sel.add(new Option(m, m)));
   if (list.includes(prev)) sel.value = prev; else if (list.includes(j.default)) sel.value = j.default;
-  if (vision.length) { if (!state.doc) status('Ready — Ollama connected'); return; }
-  if (!j.ok) status(j.error, true);
-  else status('No vision model found — run in WSL: ollama pull ' + j.default, true);
-  setTimeout(() => loadModels().catch(() => {}), 10000);  // keep checking until a vision model is available
+
+  const tSel = $('#tModel'), tPrev = tSel.value; tSel.innerHTML = '';
+  const tList = j.models.filter(m => !/embed/i.test(m));
+  tList.forEach(m => tSel.add(new Option(m, m)));
+  const tHas = tList.includes(j.translate_default);
+  if (tList.includes(tPrev)) tSel.value = tPrev; else if (tHas) tSel.value = j.translate_default;
+
+  const missing = !j.ok ? j.error
+    : !vision.length ? 'No vision model found — run in WSL: ollama pull ' + j.default
+    : !tHas ? 'Translation model missing — run in WSL: ollama pull ' + j.translate_default : '';
+  if (!missing) { if (!state.doc) status('Ready — Ollama connected'); return; }
+  status(missing, true);
+  setTimeout(() => loadModels().catch(() => {}), 10000);  // keep checking until the models are available
 }
+
+/* ---------- tabs ---------- */
+function setTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.for-table').forEach(el => el.hidden = tab !== 'table');
+  document.querySelectorAll('.for-translate').forEach(el => el.hidden = tab !== 'translate');
+  try { localStorage.setItem('tab', tab); } catch {}
+  refreshButtons();
+}
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => setTab(b.dataset.tab));
 
 /* ---------- document / pages ---------- */
 async function openFile(f) {
@@ -171,7 +239,7 @@ $('#prev').onclick = () => showPage(state.page - 1);
 $('#next').onclick = () => showPage(state.page + 1);
 $('#pageNo').onchange = e => { const n = parseInt(e.target.value, 10); if (n) showPage(n - 1); else e.target.value = state.page + 1; };
 document.addEventListener('keydown', e => {
-  if (!state.doc || e.target.closest('td, input, select')) return;
+  if (!state.doc || e.target.closest('td, input, select, textarea')) return;
   if (e.key === 'ArrowRight' || e.key === 'PageDown') showPage(state.page + 1);
   if (e.key === 'ArrowLeft' || e.key === 'PageUp') showPage(state.page - 1);
 });
@@ -307,8 +375,47 @@ $('#export').onclick = async () => {
   } catch (e) { status(e.message, true); }
 };
 
+/* ---------- translation ---------- */
+const LANG_NAMES = { ur: 'Urdu', 'pa-Arab': 'Punjabi (Shahmukhi)', 'pa-Guru': 'Punjabi (Gurmukhi)', 'sd-Arab': 'Sindhi', en: 'English' };
+async function translate(body, label) {
+  const model = $('#tModel').value;
+  busy(true); status(`${body.rect ? 'Reading and translating' : 'Translating'} ${label} with ${model}… (first run loads the model, may take a minute)`);
+  try {
+    const j = await api('/api/translate', { method: 'POST', body: JSON.stringify({ ...body, model, source: $('#srcLang').value, target: $('#tgtLang').value }) });
+    const put = (el, text) => {  // selections can accumulate; typed text is always replaced
+      const add = body.rect && $('#appendOut').checked && el.value.trim();
+      el.value = add ? el.value.trimEnd() + '\n\n' + text : text;
+      el.scrollTop = el.scrollHeight;
+    };
+    if (body.rect && j.original) put($('#srcText'), j.original);
+    if (!j.ok) status(j.error, true);
+    else {
+      put($('#outText'), j.translation);
+      const detected = $('#srcLang').value === 'auto' ? ` Detected ${LANG_NAMES[j.source]} — change “From” if that's wrong.` : '';
+      const fix = body.rect ? ' Check the transcribed original; if it has errors, fix it and click “Translate text”.' : '';
+      status(`Translated in ${j.seconds}s.${detected}${fix}`);
+    }
+  } catch (e) { status(e.message, true); }
+  busy(false);
+}
+$('#translateText').onclick = () => translate({ text: $('#srcText').value }, 'text');
+$('#translateSel').onclick = () => state.sel && translate({ id: state.doc, page: state.page, rect: state.sel }, `selection on page ${state.page + 1}`);
+$('#srcText').addEventListener('input', refreshButtons);
+$('#srcText').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) $('#translateText').click(); });
+$('#clearOut').onclick = () => { $('#outText').value = ''; };
+$('#copyOut').onclick = async () => {
+  try { await navigator.clipboard.writeText($('#outText').value); status('Translation copied.'); } catch { status('Clipboard not available', true); }
+};
+$('#saveOut').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['﻿' + $('#outText').value], { type: 'text/plain;charset=utf-8' }));
+  a.download = 'translation.txt'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+};
+
 function refreshButtons() {
   const has = !!state.doc;
+  $('#translateSel').disabled = !has || !state.sel || state.busy;
+  $('#translateText').disabled = !$('#srcText').value.trim() || state.busy;
   $('#prev').disabled = !has || state.page <= 0;
   $('#next').disabled = !has || state.page >= state.pages - 1;
   $('#extract').disabled = !has || !state.sel || state.busy;
@@ -318,7 +425,9 @@ function refreshButtons() {
   $('#export').disabled = !rows; $('#copy').disabled = !rows;
 }
 window.addEventListener('resize', drawSel);
-refreshButtons();
+let savedTab = 'table';
+try { savedTab = localStorage.getItem('tab') || 'table'; } catch {}
+setTab(savedTab === 'translate' ? 'translate' : 'table');
 loadModels().catch(e => status(e.message, true));
 </script>
 </body>
