@@ -12,7 +12,13 @@ Fix any cells, add a title, then download as `.xlsx`. Nothing leaves your machin
   digital PDFs, or Tesseract's orientation detection for scans), plus ⟲ ⟳ buttons to rotate any page by hand
 - Drag to select the table region on the page
 - Extraction by a local vision model running in [Ollama](https://ollama.com) (default: `qwen2.5vl:7b`)
-- Editable grid: edit cells, add or remove rows and columns, mark the first row as a header
+- Spreadsheet-style editor for fixing the result:
+  - select cells by dragging, Shift+click/arrows, or the row numbers and column letters
+  - move cells by dragging the selection's edge, cut and paste, or move whole rows/columns with Alt+arrows
+  - merge cells (their text is joined) and unmerge; merges are kept in the `.xlsx`
+  - insert/delete rows and columns, clear, undo/redo (Ctrl+Z / Ctrl+Y), right-click menu
+  - copy/paste to and from Excel; double-click, Enter/F2 or just type to edit a cell
+  - mark the first row as a header
 - **Append rows** for tables that continue across pages (a repeated header row is skipped)
 - Optional table title, placed above the table in the spreadsheet
 - `.xlsx` export with real numbers (`12,450`, `12.3%`, `$1,200.50`, `(9,870)` keep their formatting), or copy as tab-separated text to paste into Excel

@@ -401,7 +401,7 @@ def to_cell_value(s):
     return v, (None if fmt == "0" else fmt)
 
 
-def build_xlsx(title, rows, header):
+def build_xlsx(title, rows, header, merges=()):
     wb = Workbook()
     ws = wb.active
     ws.title = (re.sub(r"[\\/*?:\[\]]", "", title)[:31] or "Table")
@@ -428,11 +428,23 @@ def build_xlsx(title, rows, header):
                 c.font = Font(bold=True)
                 c.fill = PatternFill("solid", fgColor="D9E1F2")
                 c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    wide = set()  # text of cells merged across columns shouldn't widen just their first column
+    for m in merges:
+        r, c, rs, cs = int(m["r"]), int(m["c"]), int(m.get("rs", 1)), int(m.get("cs", 1))
+        if r < 0 or c < 0 or r + rs > len(rows) or c + cs > width or (rs == 1 and cs == 1):
+            continue
+        ws.merge_cells(start_row=start + r, start_column=c + 1, end_row=start + r + rs - 1, end_column=c + cs)
+        top = ws.cell(row=start + r, column=c + 1)
+        top.alignment = Alignment(horizontal=top.alignment.horizontal or "center", vertical="center", wrap_text=True)
+        if cs > 1:
+            wide.add((r, c))
     for j in range(width):
-        longest = max((len(r[j]) if j < len(r) else 0 for r in rows), default=8)
+        longest = max((len(r[j]) if j < len(r) and (i, j) not in wide else 0 for i, r in enumerate(rows)), default=8)
         ws.column_dimensions[get_column_letter(j + 1)].width = min(max(10, longest + 2), 60)
     if header and rows:
-        ws.freeze_panes = ws.cell(row=start + 1, column=1)
+        # Freeze below the header, including header cells merged down into the next row(s).
+        head_rows = max([1] + [int(m.get("rs", 1)) for m in merges if int(m["r"]) == 0])
+        ws.freeze_panes = f"A{start + min(head_rows, len(rows))}"
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -475,6 +487,12 @@ class Handler(BaseHTTPRequestHandler):
             if url.path in ("/", "/index.html"):
                 with open(os.path.join(STATIC, "index.html"), "rb") as f:
                     return self.send(200, f.read(), "text/html; charset=utf-8")
+            if re.fullmatch(r"/[\w-]+\.(js|css)", url.path):  # flat static assets only (no paths)
+                fpath = os.path.join(STATIC, url.path[1:])
+                if os.path.isfile(fpath):
+                    with open(fpath, "rb") as f:
+                        ctype = "text/javascript" if fpath.endswith(".js") else "text/css"
+                        return self.send(200, f.read(), ctype + "; charset=utf-8")
             if url.path == "/api/models":
                 try:
                     tags = ollama_request("/api/tags", timeout=5)
@@ -562,7 +580,7 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/export":
                 req = json.loads(self.body())
                 title = req.get("title", "")
-                data = build_xlsx(title, req.get("rows", []), bool(req.get("header", True)))
+                data = build_xlsx(title, req.get("rows", []), bool(req.get("header", True)), req.get("merges") or [])
                 fname = (re.sub(r'[\\/:*?"<>|]+', "_", title).strip() or "table") + ".xlsx"
                 return self.send(200, data,
                                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

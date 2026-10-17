@@ -37,12 +37,33 @@
   #drop.over { outline: 3px dashed var(--accent); outline-offset: -8px; }
   #tableWrap { flex: 1; overflow: auto; padding: 12px; }
   #title { width: 100%; font-size: 18px; font-weight: 600; text-align: center; margin-bottom: 10px; }
-  table { border-collapse: collapse; min-width: 100%; }
-  td { border: 1px solid var(--line); padding: 4px 6px; min-width: 60px; vertical-align: top; white-space: pre-wrap; outline: none; }
-  td:focus { box-shadow: inset 0 0 0 2px var(--accent); }
-  tr.head td { background: var(--head); font-weight: 600; text-align: center; }
-  td.rn { background: var(--bg); color: var(--muted); font-size: 11px; text-align: right; min-width: 28px; width: 28px; user-select: none; }
-  td.cur { background: var(--sel); }
+  #gridBox { position: relative; outline: none; width: fit-content; min-width: 100%; }
+  table.sheet { border-collapse: collapse; min-width: 100%; user-select: none; }
+  .sheet td { border: 1px solid var(--line); padding: 4px 6px; min-width: 60px; vertical-align: top; white-space: pre-wrap; outline: none; cursor: cell; }
+  .sheet td.merged { vertical-align: middle; }
+  .sheet td.sel { background: var(--sel); }
+  .sheet td.active { background: var(--panel); }
+  .sheet td.editing { background: var(--panel); user-select: text; cursor: text; box-shadow: inset 0 0 0 2px var(--accent); }
+  .sheet tr.head td { background: var(--head); font-weight: 600; text-align: center; }
+  .sheet tr.head td.sel { background: color-mix(in srgb, var(--head) 50%, var(--accent) 30%); }
+  .sheet th { background: var(--bg); color: var(--muted); font-size: 11px; font-weight: 500; border: 1px solid var(--line); padding: 2px 6px; cursor: pointer; position: sticky; z-index: 1; }
+  .sheet thead th { top: 0; }
+  .sheet th.rh { left: 0; text-align: right; min-width: 28px; }
+  .sheet th.corner { left: 0; z-index: 2; }
+  .sheet th.hl { background: var(--sel); color: var(--ink); }
+  .selrect { position: absolute; display: none; border: 2px solid var(--accent); pointer-events: none; box-sizing: border-box; z-index: 3; }
+  .selrect .edge { position: absolute; pointer-events: auto; cursor: move; }
+  .selrect .edge.t { top: -5px; left: 0; right: 0; height: 8px; }
+  .selrect .edge.b { bottom: -5px; left: 0; right: 0; height: 8px; }
+  .selrect .edge.l { left: -5px; top: 0; bottom: 0; width: 8px; }
+  .selrect .edge.r { right: -5px; top: 0; bottom: 0; width: 8px; }
+  .selrect.editing .edge { display: none; }
+  .ghost { position: absolute; display: none; border: 2px dashed var(--accent); pointer-events: none; z-index: 4; box-sizing: border-box; }
+  .ctxmenu { position: fixed; z-index: 50; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 4px; box-shadow: 0 6px 24px rgba(0,0,0,.25); min-width: 220px; }
+  .ctxmenu button { display: flex; width: 100%; justify-content: space-between; gap: 16px; border: 0; background: transparent; padding: 5px 10px; border-radius: 4px; text-align: left; }
+  .ctxmenu button:hover { background: var(--sel); }
+  .ctxmenu kbd { color: var(--muted); font: 11px system-ui, sans-serif; }
+  .ctxmenu hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0; }
   .hint { color: var(--muted); font-size: 12px; padding: 0 10px 8px; }
   #spinner { display: none; width: 14px; height: 14px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -142,25 +163,38 @@
 
   <section class="pane for-table" id="tablePane">
     <div class="bar">
-      <button id="addRow" title="Insert row below the selected cell">+ Row</button>
-      <button id="delRow">− Row</button>
-      <button id="addCol" title="Insert column right of the selected cell">+ Col</button>
-      <button id="delCol">− Col</button>
+      <span class="grp">
+        <button id="undo" title="Undo (Ctrl+Z)">↶</button>
+        <button id="redo" title="Redo (Ctrl+Y)">↷</button>
+      </span>
+      <span class="grp">
+        <button id="merge" title="Merge the selected cells, joining their text (Ctrl+M)">Merge</button>
+        <button id="unmerge" title="Split merged cells in the selection">Unmerge</button>
+      </span>
+      <span class="grp">
+        <button id="addRow" title="Insert rows below the selection">+ Row</button>
+        <button id="delRow" title="Delete the selected rows">− Row</button>
+        <button id="addCol" title="Insert columns right of the selection">+ Col</button>
+        <button id="delCol" title="Delete the selected columns">− Col</button>
+      </span>
       <label><input type="checkbox" id="hasHeader" checked> First row is header</label>
       <span class="spacer"></span>
-      <button id="copy" title="Copy as tab-separated text (pastes into Excel)">Copy</button>
+      <button id="copy" title="Copy the whole table as tab-separated text (pastes into Excel)">Copy all</button>
       <button class="primary" id="export">Download .xlsx</button>
     </div>
+    <div class="hint" style="padding-top:8px">Drag to select cells · Shift+click to extend · drag the blue edge to move · double-click or type to edit · right-click for more · Alt+arrows move rows/columns</div>
     <div id="tableWrap">
       <input type="text" id="title" placeholder="Table title (optional)">
-      <table id="grid"></table>
+      <div id="gridBox"></div>
     </div>
   </section>
 </main>
 
+<script src="grid.js"></script>
 <script>
 const $ = s => document.querySelector(s);
-const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, rows: [], cur: [0, 0], busy: false, tab: 'table', rot: {}, shownRot: 0 };
+const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, busy: false, tab: 'table', rot: {}, shownRot: 0 };
+let grid = null;  // table editor (grid.js); holds the table data
 
 function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
 function busy(on) { state.busy = on; $('#spinner').style.display = on ? 'inline-block' : 'none'; refreshButtons(); }
@@ -270,7 +304,7 @@ $('#prev').onclick = () => showPage(state.page - 1);
 $('#next').onclick = () => showPage(state.page + 1);
 $('#pageNo').onchange = e => { const n = parseInt(e.target.value, 10); if (n) showPage(n - 1); else e.target.value = state.page + 1; };
 document.addEventListener('keydown', e => {
-  if (!state.doc || e.target.closest('td, input, select, textarea')) return;
+  if (!state.doc || e.target.closest('td, input, select, textarea, #gridBox')) return;
   if (e.key === 'ArrowRight' || e.key === 'PageDown') showPage(state.page + 1);
   if (e.key === 'ArrowLeft' || e.key === 'PageUp') showPage(state.page - 1);
 });
@@ -323,80 +357,43 @@ $('#extract').onclick = async () => {
     const j = await api('/api/extract', { method: 'POST', body: JSON.stringify({ id: state.doc, page: state.page, rect: state.sel, rot: rotOf(state.page), model }) });
     if (!j.ok) { status(j.error, true); console.log('raw model output:', j.raw); }
     else {
-      const append = document.querySelector('input[name=mode]:checked').value === 'append' && state.rows.length;
+      const append = document.querySelector('input[name=mode]:checked').value === 'append' && grid.hasData();
       let rows = j.rows;
       if (append) {
         // Skip a repeated header row when a table continues across pages.
         const same = (a, b) => a.length === b.length && a.every((c, i) => c.trim().toLowerCase() === (b[i] || '').trim().toLowerCase());
-        if ($('#hasHeader').checked && same(rows[0], state.rows[0])) rows = rows.slice(1);
-        state.rows = state.rows.concat(rows);
-      } else state.rows = rows;
-      squareUp(); renderGrid();
-      status(`${append ? 'Appended' : 'Extracted'} ${rows.length} rows × ${state.rows[0].length} cols in ${j.seconds}s. Review and edit cells, then download.`);
+        if ($('#hasHeader').checked && same(rows[0], grid.rows[0])) rows = rows.slice(1);
+        grid.appendRows(rows);
+      } else grid.setData(rows);
+      status(`${append ? 'Appended' : 'Extracted'} ${rows.length} rows × ${grid.rows[0].length} cols in ${j.seconds}s. Review and edit cells, then download. (Ctrl+Z undoes)`);
     }
   } catch (e) { status(e.message, true); }
   busy(false);
 };
 
-/* ---------- editable grid ---------- */
-function squareUp() {
-  const w = Math.max(1, ...state.rows.map(r => r.length));
-  state.rows = state.rows.map(r => r.concat(Array(w - r.length).fill('')));
-}
-function renderGrid() {
-  const t = $('#grid'); t.innerHTML = '';
-  const header = $('#hasHeader').checked;
-  state.rows.forEach((row, r) => {
-    const tr = t.insertRow();
-    if (header && r === 0) tr.className = 'head';
-    const rn = tr.insertCell(); rn.className = 'rn'; rn.textContent = r + 1;
-    row.forEach((val, c) => {
-      const td = tr.insertCell();
-      td.contentEditable = 'plaintext-only';
-      if (td.contentEditable !== 'plaintext-only') td.contentEditable = 'true';
-      td.textContent = val; td.dataset.r = r; td.dataset.c = c;
-    });
-  });
-  markCur(); refreshButtons();
-}
-const grid = $('#grid');
-grid.addEventListener('input', e => { const td = e.target.closest('td[data-r]'); if (td) state.rows[td.dataset.r][td.dataset.c] = td.innerText.replace(/\n$/, ''); });
-grid.addEventListener('pointerdown', e => { const td = e.target.closest('td[data-r]'); if (td) { state.cur = [+td.dataset.r, +td.dataset.c]; markCur(); } });
-grid.addEventListener('focusin', e => { const td = e.target.closest('td[data-r]'); if (td) { state.cur = [+td.dataset.r, +td.dataset.c]; markCur(); } });
-grid.addEventListener('paste', e => { e.preventDefault(); document.execCommand('insertText', false, e.clipboardData.getData('text/plain')); });
-grid.addEventListener('keydown', e => {
-  const td = e.target.closest('td[data-r]'); if (!td) return;
-  let [r, c] = [+td.dataset.r, +td.dataset.c];
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); r++; }
-  else if (e.key === 'ArrowDown' && e.altKey) r++;
-  else if (e.key === 'ArrowUp' && e.altKey) r--;
-  else return;
-  const next = grid.querySelector(`td[data-r="${r}"][data-c="${c}"]`);
-  if (next) { next.focus(); const s = getSelection(); s.selectAllChildren(next); s.collapseToEnd(); }
-});
-function markCur() {
-  grid.querySelectorAll('td.cur').forEach(td => td.classList.remove('cur'));
-  const [r, c] = state.cur;
-  grid.querySelectorAll(`td[data-c="${c}"]`).forEach(td => td.classList.add('cur'));
-  const rn = grid.rows[r] && grid.rows[r].cells[0]; if (rn) rn.classList.add('cur');
-}
-function ensureTable() { if (!state.rows.length) { state.rows = [['', '', ''], ['', '', '']]; state.cur = [0, 0]; } }
-function clampCur() { state.cur = [Math.min(state.cur[0], state.rows.length - 1), Math.min(state.cur[1], (state.rows[0] || []).length - 1)].map(v => Math.max(0, v)); }
-$('#addRow').onclick = () => { ensureTable(); const w = state.rows[0].length; state.rows.splice(state.cur[0] + 1, 0, Array(w).fill('')); state.cur[0]++; renderGrid(); };
-$('#delRow').onclick = () => { state.rows.splice(state.cur[0], 1); if (!state.rows.length) state.rows = []; clampCur(); renderGrid(); };
-$('#addCol').onclick = () => { ensureTable(); state.rows.forEach(r => r.splice(state.cur[1] + 1, 0, '')); state.cur[1]++; renderGrid(); };
-$('#delCol').onclick = () => { state.rows.forEach(r => r.splice(state.cur[1], 1)); if (!state.rows[0].length) state.rows = []; clampCur(); renderGrid(); };
-$('#hasHeader').onchange = renderGrid;
+/* ---------- editable grid (see grid.js) ---------- */
+grid = createGrid({ box: $('#gridBox'), onChange: () => refreshButtons(), status: (m, err) => status(m, err),
+                          hasHeader: () => $('#hasHeader').checked });
+const keepFocus = fn => () => { fn(); $('#gridBox').focus({ preventScroll: true }); };
+$('#undo').onclick = keepFocus(() => grid.undo());
+$('#redo').onclick = keepFocus(() => grid.redo());
+$('#merge').onclick = keepFocus(() => grid.merge());
+$('#unmerge').onclick = keepFocus(() => grid.unmerge());
+$('#addRow').onclick = keepFocus(() => grid.insertRowsBelow());
+$('#delRow').onclick = keepFocus(() => grid.deleteRows());
+$('#addCol').onclick = keepFocus(() => grid.insertColsRight());
+$('#delCol').onclick = keepFocus(() => grid.deleteCols());
+$('#hasHeader').onchange = () => grid.render();
 
 $('#copy').onclick = async () => {
-  const tsv = [($('#title').value.trim() ? [$('#title').value.trim()] : []), ...state.rows]
-    .filter(r => r.length).map(r => r.map(c => /[\t\n"]/.test(c) ? '"' + c.replace(/"/g, '""') + '"' : c).join('\t')).join('\n');
+  const title = $('#title').value.trim();
+  const tsv = (title ? title + '\n' : '') + grid.copyText();
   try { await navigator.clipboard.writeText(tsv); status('Copied — paste into Excel.'); } catch { status('Clipboard not available', true); }
 };
 $('#export').onclick = async () => {
   try {
     const title = $('#title').value;
-    const r = await api('/api/export', { method: 'POST', body: JSON.stringify({ title, rows: state.rows, header: $('#hasHeader').checked }) });
+    const r = await api('/api/export', { method: 'POST', body: JSON.stringify({ title, rows: grid.rows, merges: grid.merges, header: $('#hasHeader').checked }) });
     const blob = await r.blob();
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -451,9 +448,10 @@ function refreshButtons() {
   $('#next').disabled = !has || state.page >= state.pages - 1;
   $('#extract').disabled = !has || !state.sel || state.busy;
   $('#clearSel').disabled = !state.sel;
-  const rows = state.rows.length;
-  $('#delRow').disabled = !rows; $('#delCol').disabled = !rows;
-  $('#export').disabled = !rows; $('#copy').disabled = !rows;
+  if (!grid) return;
+  const rows = grid.hasData();
+  for (const id of ['delRow', 'delCol', 'merge', 'unmerge', 'export', 'copy']) $('#' + id).disabled = !rows;
+  $('#undo').disabled = !grid.canUndo(); $('#redo').disabled = !grid.canRedo();
 }
 window.addEventListener('resize', drawSel);
 let savedTab = 'table';
