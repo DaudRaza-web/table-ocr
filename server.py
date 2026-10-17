@@ -1,0 +1,369 @@
+"""Table OCR tool - local server.
+
+Renders PDF/image pages, crops the user-selected region and sends it to a
+vision model running in the local Ollama (WSL), then exports the edited table
+to .xlsx. Everything runs on this machine; nothing leaves localhost.
+"""
+import base64
+import io
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import uuid
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, unquote, urlparse
+
+import pymupdf
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+# --lan listens on all network interfaces so other devices on the local network can connect.
+HOST = os.environ.get("TABLE_OCR_HOST", "0.0.0.0" if "--lan" in sys.argv else "127.0.0.1")
+PORT = int(os.environ.get("TABLE_OCR_PORT", "8765"))
+OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+DEFAULT_MODEL = os.environ.get("TABLE_OCR_MODEL", "qwen2.5vl:7b")
+WSL_DISTRO = os.environ.get("TABLE_OCR_WSL_DISTRO", "")  # "" = default distro
+STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+DOCS = {}  # doc id -> pymupdf.Document
+DOCS_LOCK = threading.Lock()
+
+PROMPT = """You are a precise OCR engine for tables.
+Transcribe the table in this image into JSON: {"rows": [[cell, cell, ...], ...]}.
+Rules:
+- One inner array per visual row, top to bottom, including the header row(s).
+- Every row must have the same number of cells; use "" for empty cells.
+- If a cell spans several columns, put its text in the first cell and "" in the others.
+- Copy text exactly as printed (numbers, signs, decimals, currency symbols, %). Do not translate, sum, or invent values.
+- Multi-line text inside one cell is joined with a single space.
+Return only the JSON."""
+
+SCHEMA = {
+    "type": "object",
+    "properties": {"rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}}},
+    "required": ["rows"],
+}
+
+
+# ---------------------------------------------------------------- Ollama ---
+
+def ollama_request(path, payload=None, timeout=10):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(OLLAMA + path, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def ollama_up():
+    try:
+        ollama_request("/api/version", timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_ollama():
+    """Make sure the WSL Ollama is reachable; boot WSL / start `ollama serve` if needed."""
+    wsl = ["wsl.exe"] + (["-d", WSL_DISTRO] if WSL_DISTRO else [])
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if sys.platform == "win32":
+        # Keep the WSL VM alive while this tool runs (WSL idles out otherwise).
+        try:
+            subprocess.Popen(wsl + ["-e", "sleep", "infinity"], creationflags=flags,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+    for _ in range(20):
+        if ollama_up():
+            return True
+        time.sleep(0.5)
+    if sys.platform == "win32":
+        print("Ollama not reachable - starting `ollama serve` inside WSL ...")
+        subprocess.Popen(wsl + ["-e", "bash", "-lc", "ollama serve"], creationflags=flags,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(40):
+            if ollama_up():
+                return True
+            time.sleep(0.5)
+    return False
+
+
+def parse_rows(text):
+    """Model output -> list of rows (list of str). Accepts JSON or a markdown table."""
+    text = text.strip()
+    m = re.search(r"\{.*\}|\[.*\]", text, re.S)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            rows = obj.get("rows") if isinstance(obj, dict) else obj
+            if isinstance(rows, list):
+                return [[("" if c is None else str(c)).strip() for c in (r if isinstance(r, list) else [r])]
+                        for r in rows]
+        except json.JSONDecodeError:
+            pass
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+            continue
+        rows.append(cells)
+    return rows
+
+
+def normalize(rows):
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    width = max((len(r) for r in rows), default=0)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    # drop columns that are empty everywhere
+    keep = [i for i in range(width) if any(r[i].strip() for r in rows)]
+    return [[r[i] for i in keep] for r in rows]
+
+
+# ------------------------------------------------------------- documents ---
+
+def open_document(data, filename):
+    ext = os.path.splitext(filename)[1].lower().lstrip(".") or None
+    doc = pymupdf.open(stream=data, filetype=ext)
+    if not doc.is_pdf:  # images (png/jpg/tiff/...) -> convert so every page renders the same way
+        pdf = pymupdf.open("pdf", doc.convert_to_pdf())
+        doc.close()
+        doc = pdf
+    return doc
+
+
+def render_crop(doc, page_no, rect_frac):
+    page = doc[page_no]
+    r = page.rect
+    x0, y0, x1, y1 = rect_frac
+    clip = pymupdf.Rect(r.x0 + x0 * r.width, r.y0 + y0 * r.height,
+                        r.x0 + x1 * r.width, r.y0 + y1 * r.height)
+    # Aim for the longest side at ~1600px: sharp enough for small print, small enough for the model.
+    longest = max(clip.width, clip.height)
+    zoom = max(1.0, min(1600 / longest, 6.0))
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip, alpha=False)
+    return pix.tobytes("png")
+
+
+# ------------------------------------------------------------ excel export --
+
+NUM_RE = re.compile(r"^\(?-?[$€£]?\s?\d{1,3}(,\d{3})*(\.\d+)?\)?%?$|^\(?-?[$€£]?\s?\d+(\.\d+)?\)?%?$")
+
+
+def to_cell_value(s):
+    t = s.strip()
+    if not t or not NUM_RE.match(t) or (len(t) > 1 and t[0] == "0" and t[1].isdigit()):
+        return s, None
+    neg = t.startswith("(") and t.endswith(")") or t.lstrip("(").startswith("-")
+    pct = t.endswith("%")
+    core = re.sub(r"[()$€£%,\s-]", "", t)
+    try:
+        v = float(core)
+    except ValueError:
+        return s, None
+    if neg:
+        v = -v
+    decimals = len(core.split(".")[1]) if "." in core else 0
+    frac = ("." + "0" * decimals) if decimals else ""
+    if pct:
+        return v / 100, "0" + frac + "%"
+    sym = next((ch for ch in "$€£" if ch in t), "")
+    base = "#,##0" if "," in t or sym else "0"
+    if not decimals:
+        v = int(v)
+    fmt = sym + base + frac  # keep printed separators/decimals (e.g. 1.50, $1,200)
+    return v, (None if fmt == "0" else fmt)
+
+
+def build_xlsx(title, rows, header):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (re.sub(r"[\\/*?:\[\]]", "", title)[:31] or "Table")
+    width = max((len(r) for r in rows), default=1)
+    thin = Side(style="thin", color="A0A0A0")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    start = 1
+    if title.strip():
+        ws.cell(row=1, column=1, value=title.strip()).font = Font(bold=True, size=14)
+        if width > 1:
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=width)
+        ws.cell(row=1, column=1).alignment = Alignment(horizontal="center")
+        start = 3
+    for i, row in enumerate(rows):
+        for j in range(width):
+            text = row[j] if j < len(row) else ""
+            is_head = header and i == 0
+            value, fmt = (text, None) if is_head else to_cell_value(text)
+            c = ws.cell(row=start + i, column=j + 1, value=value)
+            c.border = border
+            if fmt:
+                c.number_format = fmt
+            if is_head:
+                c.font = Font(bold=True)
+                c.fill = PatternFill("solid", fgColor="D9E1F2")
+                c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for j in range(width):
+        longest = max((len(r[j]) if j < len(r) else 0 for r in rows), default=8)
+        ws.column_dimensions[get_column_letter(j + 1)].width = min(max(10, longest + 2), 60)
+    if header and rows:
+        ws.freeze_panes = ws.cell(row=start + 1, column=1)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ------------------------------------------------------------------ HTTP ---
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s\n" % (fmt % args))
+
+    def send(self, code, body, ctype="application/json", extra=None):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def body(self):
+        return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+
+    def get_doc(self, doc_id):
+        with DOCS_LOCK:
+            doc = DOCS.get(doc_id)
+        if doc is None:
+            raise KeyError("Document not found - please reopen the file.")
+        return doc
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(url.query).items()}
+        try:
+            if url.path in ("/", "/index.html"):
+                with open(os.path.join(STATIC, "index.html"), "rb") as f:
+                    return self.send(200, f.read(), "text/html; charset=utf-8")
+            if url.path == "/api/models":
+                try:
+                    tags = ollama_request("/api/tags", timeout=5)
+                except Exception as e:
+                    return self.send(200, {"ok": False, "error": f"Ollama not reachable at {OLLAMA}: {e}",
+                                           "models": [], "default": DEFAULT_MODEL})
+                names = [m["name"] for m in tags.get("models", [])]
+                return self.send(200, {"ok": True, "models": names, "default": DEFAULT_MODEL})
+            if url.path == "/api/page":
+                doc = self.get_doc(q["id"])
+                with DOCS_LOCK:
+                    page = doc[int(q["n"])]
+                    zoom = float(q.get("dpi", 150)) / 72
+                    png = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False).tobytes("png")
+                return self.send(200, png, "image/png")
+            self.send(404, {"error": "not found"})
+        except Exception as e:
+            self.send(400, {"error": str(e)})
+
+    def do_POST(self):
+        url = urlparse(self.path)
+        try:
+            if url.path == "/api/upload":
+                name = unquote(self.headers.get("X-Filename", "file.pdf"))
+                doc = open_document(self.body(), name)
+                doc_id = uuid.uuid4().hex
+                with DOCS_LOCK:
+                    DOCS[doc_id] = doc
+                return self.send(200, {"id": doc_id, "pages": doc.page_count, "name": name})
+
+            if url.path == "/api/extract":
+                req = json.loads(self.body())
+                doc = self.get_doc(req["id"])
+                with DOCS_LOCK:
+                    png = render_crop(doc, int(req["page"]), req["rect"])
+                model = req.get("model") or DEFAULT_MODEL
+                t0 = time.time()
+                res = ollama_request("/api/chat", {
+                    "model": model,
+                    "stream": False,
+                    "format": SCHEMA,
+                    "keep_alive": "15m",
+                    "options": {"temperature": 0, "num_ctx": 16384, "num_predict": 8192},
+                    "messages": [{"role": "user", "content": PROMPT,
+                                  "images": [base64.b64encode(png).decode()]}],
+                }, timeout=900)
+                text = res.get("message", {}).get("content", "")
+                rows = normalize(parse_rows(text))
+                if not rows:
+                    return self.send(200, {"ok": False, "error": "The model did not return a table. Try a tighter selection.",
+                                           "raw": text})
+                return self.send(200, {"ok": True, "rows": rows, "seconds": round(time.time() - t0, 1),
+                                       "model": model})
+
+            if url.path == "/api/export":
+                req = json.loads(self.body())
+                title = req.get("title", "")
+                data = build_xlsx(title, req.get("rows", []), bool(req.get("header", True)))
+                fname = (re.sub(r'[\\/:*?"<>|]+', "_", title).strip() or "table") + ".xlsx"
+                return self.send(200, data,
+                                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 {"Content-Disposition": f'attachment; filename="{fname}"'})
+
+            if url.path == "/api/close":
+                req = json.loads(self.body())
+                with DOCS_LOCK:
+                    doc = DOCS.pop(req.get("id"), None)
+                if doc:
+                    doc.close()
+                return self.send(200, {"ok": True})
+            self.send(404, {"error": "not found"})
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            self.send(502, {"error": f"Ollama error {e.code}: {detail}"})
+        except Exception as e:
+            self.send(400, {"error": f"{type(e).__name__}: {e}"})
+
+
+def lan_ips():
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    return sorted(ip for ip in ips if not ip.startswith(("127.", "169.254.", "172.")))  # skip loopback/WSL/Docker
+
+
+def main():
+    print(f"Checking Ollama at {OLLAMA} ...")
+    print("Ollama OK" if ensure_ollama() else "WARNING: Ollama not reachable; extraction will fail until it is up.")
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    url = f"http://127.0.0.1:{PORT}/"
+    print(f"Table OCR running at {url}  (Ctrl+C to stop)")
+    if HOST != "127.0.0.1":
+        print("Open from other devices on your network at:")
+        for ip in lan_ips():
+            print(f"    http://{ip}:{PORT}/")
+    if "--no-browser" not in sys.argv:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
