@@ -51,6 +51,7 @@
   .tabs button.active { background: var(--panel); box-shadow: 0 1px 3px rgba(0,0,0,.15); font-weight: 600; }
   [hidden] { display: none !important; }
   .muted { color: var(--muted); font-weight: 400; }
+  .grp { display: inline-flex; gap: 8px; align-items: center; white-space: nowrap; }
   .tx { flex: 1; display: flex; flex-direction: column; gap: 8px; padding: 12px; min-height: 0; }
   .tx > label, .tx .row label { font-weight: 600; }
   .tx .row { display: flex; gap: 8px; align-items: center; }
@@ -87,6 +88,11 @@
       <span id="zoomLbl">100%</span>
       <button id="zoomIn" title="Zoom in">+</button>
       <button id="fit">Fit</button>
+      <span class="grp">
+        <button id="rotL" title="Rotate page anticlockwise">⟲</button>
+        <button id="rotR" title="Rotate page clockwise">⟳</button>
+        <label title="Turn sideways or upside-down pages upright automatically"><input type="checkbox" id="autoRot" checked> Auto-rotate</label>
+      </span>
     </div>
     <div class="bar">
       <button class="primary for-table" id="extract" disabled>Extract table</button>
@@ -154,7 +160,7 @@
 
 <script>
 const $ = s => document.querySelector(s);
-const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, rows: [], cur: [0, 0], busy: false, tab: 'table' };
+const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, rows: [], cur: [0, 0], busy: false, tab: 'table', rot: {}, shownRot: 0 };
 
 function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
 function busy(on) { state.busy = on; $('#spinner').style.display = on ? 'inline-block' : 'none'; refreshButtons(); }
@@ -208,7 +214,7 @@ async function openFile(f) {
   try {
     if (state.doc) api('/api/close', { method: 'POST', body: JSON.stringify({ id: state.doc }) }).catch(() => {});
     const j = await api('/api/upload', { method: 'POST', headers: { 'X-Filename': encodeURIComponent(f.name).replace(/%20/g, ' ') }, body: f });
-    Object.assign(state, { doc: j.id, pages: j.pages, page: 0 });
+    Object.assign(state, { doc: j.id, pages: j.pages, page: 0, rot: {} });
     $('#fname').textContent = f.name;
     $('#pageCount').textContent = j.pages;
     $('#empty').hidden = true; $('#stage').hidden = false;
@@ -218,18 +224,43 @@ async function openFile(f) {
   busy(false);
 }
 
-function showPage(n, fit = false) {
+const rotOf = n => state.rot[n] || 0;
+async function showPage(n, fit = false) {
   n = Math.max(0, Math.min(state.pages - 1, n));
   state.page = n; clearSel();
   $('#pageNo').value = n + 1;
+  const token = state.showToken = (state.showToken || 0) + 1;
+  if ($('#autoRot').checked && state.rot[n] === undefined) {
+    try {
+      const j = await api(`/api/orient?id=${state.doc}&n=${n}`);
+      state.rot[n] = j.rotation;
+      if (j.rotation) status(`Page ${n + 1} auto-rotated ${j.rotation}°${j.method === 'guess' ? ' (direction is a guess — use ⟲ ⟳ if it is upside down)' : ''}.`);
+    } catch { state.rot[n] = 0; }
+    if (token !== state.showToken) return;  // user moved on to another page meanwhile
+  }
+  const rot = rotOf(n);
+  if (rot !== state.shownRot) fit = true;  // portrait <-> landscape changes the best zoom
+  state.shownRot = rot;
   const img = $('#pageImg');
   return new Promise(res => {
     img.onload = () => { state.natW = img.naturalWidth; if (fit) fitZoom(); else applyZoom(); res(); };
     img.onerror = () => { status('Could not render page', true); res(); };
-    img.src = `/api/page?id=${state.doc}&n=${n}&dpi=150`;
+    img.src = `/api/page?id=${state.doc}&n=${n}&dpi=150&rot=${rot}`;
     refreshButtons();
   });
 }
+function rotatePage(delta) {
+  if (!state.doc) return;
+  state.rot[state.page] = (rotOf(state.page) + delta + 360) % 360;
+  showPage(state.page);
+}
+$('#rotL').onclick = () => rotatePage(-90);
+$('#rotR').onclick = () => rotatePage(90);
+$('#autoRot').onchange = e => {
+  try { localStorage.setItem('autoRot', e.target.checked ? '1' : '0'); } catch {}
+  if (state.doc) { state.rot = {}; showPage(state.page); }  // re-detect (or reset to as-scanned)
+};
+try { $('#autoRot').checked = localStorage.getItem('autoRot') !== '0'; } catch {}
 function applyZoom() { $('#pageImg').style.width = Math.round(state.natW * state.zoom) + 'px'; $('#zoomLbl').textContent = Math.round(state.zoom * 100) + '%'; drawSel(); }
 function fitZoom() { const w = $('#viewer').clientWidth - 24; state.zoom = Math.min(1.5, w / state.natW); applyZoom(); }
 $('#zoomIn').onclick = () => { state.zoom = Math.min(4, state.zoom * 1.2); applyZoom(); };
@@ -289,7 +320,7 @@ $('#extract').onclick = async () => {
   const model = $('#model').value;
   busy(true); status(`Reading table with ${model}… (first run loads the model, may take a minute)`);
   try {
-    const j = await api('/api/extract', { method: 'POST', body: JSON.stringify({ id: state.doc, page: state.page, rect: state.sel, model }) });
+    const j = await api('/api/extract', { method: 'POST', body: JSON.stringify({ id: state.doc, page: state.page, rect: state.sel, rot: rotOf(state.page), model }) });
     if (!j.ok) { status(j.error, true); console.log('raw model output:', j.raw); }
     else {
       const append = document.querySelector('input[name=mode]:checked').value === 'append' && state.rows.length;
@@ -399,7 +430,7 @@ async function translate(body, label) {
   busy(false);
 }
 $('#translateText').onclick = () => translate({ text: $('#srcText').value }, 'text');
-$('#translateSel').onclick = () => state.sel && translate({ id: state.doc, page: state.page, rect: state.sel }, `selection on page ${state.page + 1}`);
+$('#translateSel').onclick = () => state.sel && translate({ id: state.doc, page: state.page, rect: state.sel, rot: rotOf(state.page) },`selection on page ${state.page + 1}`);
 $('#srcText').addEventListener('input', refreshButtons);
 $('#srcText').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) $('#translateText').click(); });
 $('#clearOut').onclick = () => { $('#outText').value = ''; };

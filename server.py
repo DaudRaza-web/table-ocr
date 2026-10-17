@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -32,6 +33,7 @@ OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("TABLE_OCR_MODEL", "qwen2.5vl:7b")
 TRANSLATE_MODEL = os.environ.get("TABLE_OCR_TRANSLATE_MODEL", "translategemma:12b")
 WSL_DISTRO = os.environ.get("TABLE_OCR_WSL_DISTRO", "")  # "" = default distro
+WSL = ["wsl.exe"] + (["-d", WSL_DISTRO] if WSL_DISTRO else [])
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 DOCS = {}  # doc id -> pymupdf.Document
@@ -73,7 +75,7 @@ def ollama_up():
 
 def ensure_ollama():
     """Make sure the WSL Ollama is reachable; boot WSL / start `ollama serve` if needed."""
-    wsl = ["wsl.exe"] + (["-d", WSL_DISTRO] if WSL_DISTRO else [])
+    wsl = WSL
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     if sys.platform == "win32":
         # Keep the WSL VM alive while this tool runs (WSL idles out otherwise).
@@ -140,20 +142,148 @@ def open_document(data, filename):
         pdf = pymupdf.open("pdf", doc.convert_to_pdf())
         doc.close()
         doc = pdf
+    # Bake any /Rotate into the content so every page starts at 0; our own rotation is applied on render.
+    for page in doc:
+        if page.rotation:
+            page.remove_rotation()
     return doc
 
 
-def render_crop(doc, page_no, rect_frac):
+def norm_rot(rot):
+    return int(rot or 0) % 360 // 90 * 90
+
+
+def unrotate_frac(rect_frac, rot):
+    """Selection in the displayed (rotated clockwise by `rot`) page -> fractions of the unrotated page."""
+    def pt(u, v):
+        return {0: (u, v), 90: (v, 1 - u), 180: (1 - u, 1 - v), 270: (1 - v, u)}[rot]
+    u0, v0, u1, v1 = rect_frac
+    (ax, ay), (bx, by) = pt(u0, v0), pt(u1, v1)
+    return min(ax, bx), min(ay, by), max(ax, bx), max(ay, by)
+
+
+def render_page(doc, page_no, dpi, rot=0):
+    zoom = dpi / 72
+    return doc[page_no].get_pixmap(matrix=pymupdf.Matrix(zoom, zoom).prerotate(norm_rot(rot)), alpha=False)
+
+
+def render_crop(doc, page_no, rect_frac, rot=0):
+    rot = norm_rot(rot)
     page = doc[page_no]
     r = page.rect
-    x0, y0, x1, y1 = rect_frac
+    x0, y0, x1, y1 = unrotate_frac(rect_frac, rot)
     clip = pymupdf.Rect(r.x0 + x0 * r.width, r.y0 + y0 * r.height,
                         r.x0 + x1 * r.width, r.y0 + y1 * r.height)
     # Aim for the longest side at ~1600px: sharp enough for small print, small enough for the model.
     longest = max(clip.width, clip.height)
     zoom = max(1.0, min(1600 / longest, 6.0))
-    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip, alpha=False)
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom).prerotate(rot), clip=clip, alpha=False)
     return pix.tobytes("png")
+
+
+# ------------------------------------------------------- orientation check --
+
+def orientation_from_text(page):
+    """Digital PDFs: the direction of the text lines says exactly how far the page is turned."""
+    votes = {0: 0, 90: 0, 180: 0, 270: 0}
+    for block in page.get_text("dict")["blocks"]:
+        for line in block.get("lines", []):
+            dx, dy = line["dir"]
+            n = sum(len(s["text"].strip()) for s in line["spans"])
+            if abs(dx) >= abs(dy):
+                votes[0 if dx > 0 else 180] += n
+            else:  # text running down the page needs a 270° (anticlockwise) turn, and vice versa
+                votes[270 if dy > 0 else 90] += n
+    total = sum(votes.values())
+    if total < 40:
+        return None
+    best = max(votes, key=votes.get)
+    return best if votes[best] >= 0.6 * total else None
+
+
+def is_sideways(page):
+    """Scans: lines of text make dark/light stripes. Stronger stripes across columns than rows means the
+    text runs vertically, i.e. the page is turned 90° one way or the other. None = can't tell."""
+    zoom = 600 / max(page.rect.width, page.rect.height)
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csGRAY, alpha=False)
+    w, h, s = pix.width, pix.height, pix.samples
+    rows, cols = [0] * h, [0] * w
+    for y in range(h):
+        line = s[y * pix.stride: y * pix.stride + w]
+        for x, v in enumerate(line):
+            if v < 128:
+                rows[y] += 1
+                cols[x] += 1
+    if sum(rows) < 0.002 * w * h:
+        return None  # nearly blank
+
+    def stripes(profile):
+        return sum((a - b) ** 2 for a, b in zip(profile, profile[1:])) / max(1, len(profile))
+
+    r, c = stripes(rows) / max(1, w), stripes(cols) / max(1, h)  # normalise by line length
+    if c > 1.5 * r:
+        return True
+    if r > 1.5 * c:
+        return False
+    return None
+
+
+_TESSERACT = None
+
+
+def tesseract_cmd():
+    """Tesseract on PATH, else (on Windows) inside WSL. [] if unavailable. Vision LLMs can't reliably tell
+    upright from upside-down; Tesseract's orientation detector can, for Latin and Arabic scripts alike."""
+    global _TESSERACT
+    if _TESSERACT is None:
+        _TESSERACT = []
+        if shutil.which("tesseract"):
+            _TESSERACT = ["tesseract"]
+        elif sys.platform == "win32":
+            try:
+                r = subprocess.run(WSL + ["-e", "which", "tesseract"], capture_output=True, timeout=20,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if r.returncode == 0:
+                    _TESSERACT = WSL + ["-e", "tesseract"]
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    return _TESSERACT
+
+
+def orientation_from_tesseract(png):
+    cmd = tesseract_cmd()
+    if not cmd:
+        return None
+    try:
+        r = subprocess.run(cmd + ["stdin", "stdout", "--psm", "0"], input=png, capture_output=True, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = r.stdout.decode(errors="replace")
+    rot = re.search(r"Rotate:\s*(\d+)", out)
+    conf = re.search(r"Orientation confidence:\s*([\d.]+)", out)
+    if rot and conf and float(conf.group(1)) >= 1.0:
+        return norm_rot(rot.group(1))
+    return None
+
+
+def detect_orientation(doc, page_no):
+    """-> (clockwise turn that makes the page upright, how it was decided)."""
+    with DOCS_LOCK:  # MuPDF isn't thread-safe; Tesseract runs outside the lock
+        page = doc[page_no]
+        rot = orientation_from_text(page)
+        if rot is not None:
+            return rot, "text"
+        zoom = 2000 / max(page.rect.width, page.rect.height)
+        png = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csGRAY, alpha=False).tobytes("png")
+    rot = orientation_from_tesseract(png)
+    if rot is not None:
+        return rot, "tesseract"
+    with DOCS_LOCK:
+        sideways = is_sideways(doc[page_no])
+    if sideways:  # no Tesseract (or unsure): we know it's on its side, not which way
+        return 90, "guess"
+    return 0, "unknown"
 
 
 # ------------------------------------------------------------- translation --
@@ -358,10 +488,12 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/page":
                 doc = self.get_doc(q["id"])
                 with DOCS_LOCK:
-                    page = doc[int(q["n"])]
-                    zoom = float(q.get("dpi", 150)) / 72
-                    png = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False).tobytes("png")
+                    png = render_page(doc, int(q["n"]), float(q.get("dpi", 150)), q.get("rot")).tobytes("png")
                 return self.send(200, png, "image/png")
+            if url.path == "/api/orient":
+                doc = self.get_doc(q["id"])
+                rot, how = detect_orientation(doc, int(q["n"]))
+                return self.send(200, {"rotation": rot, "method": how})
             self.send(404, {"error": "not found"})
         except Exception as e:
             self.send(400, {"error": str(e)})
@@ -381,7 +513,7 @@ class Handler(BaseHTTPRequestHandler):
                 req = json.loads(self.body())
                 doc = self.get_doc(req["id"])
                 with DOCS_LOCK:
-                    png = render_crop(doc, int(req["page"]), req["rect"])
+                    png = render_crop(doc, int(req["page"]), req["rect"], req.get("rot"))
                 model = req.get("model") or DEFAULT_MODEL
                 t0 = time.time()
                 res = ollama_request("/api/chat", {
@@ -410,7 +542,7 @@ class Handler(BaseHTTPRequestHandler):
                 if req.get("rect"):  # selected region of the page: transcribe first, then translate
                     doc = self.get_doc(req["id"])
                     with DOCS_LOCK:
-                        png = render_crop(doc, int(req["page"]), req["rect"])
+                        png = render_crop(doc, int(req["page"]), req["rect"], req.get("rot"))
                     text = clean_transcription(ollama_generate(model, transcribe_prompt(src), png))
                     if not text:
                         return self.send(200, {"ok": False, "error": "No text found in the selection."})

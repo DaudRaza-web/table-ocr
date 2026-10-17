@@ -8,6 +8,8 @@ Fix any cells, add a title, then download as `.xlsx`. Nothing leaves your machin
 
 - Open PDFs or images (PNG, JPG, TIFF, …) by picking a file or dragging it in
 - Page-by-page viewer with zoom
+- **Auto-rotate**: sideways and upside-down pages are turned upright automatically (from the text layer in
+  digital PDFs, or Tesseract's orientation detection for scans), plus ⟲ ⟳ buttons to rotate any page by hand
 - Drag to select the table region on the page
 - Extraction by a local vision model running in [Ollama](https://ollama.com) (default: `qwen2.5vl:7b`)
 - Editable grid: edit cells, add or remove rows and columns, mark the first row as a header
@@ -33,6 +35,16 @@ Pull the model once (the only step that needs internet besides installing the Py
 ollama pull qwen2.5vl:7b
 ollama pull translategemma:12b   # for the Translate tab (~8 GB, needs ~10 GB VRAM)
 ```
+
+For auto-rotating **scanned** pages, install Tesseract (optional; digital PDFs don't need it). The server finds it
+on `PATH`, or on Windows inside WSL:
+
+```bash
+sudo apt install tesseract-ocr
+```
+
+Without Tesseract, scanned pages lying on their side are still turned upright, but which way round is a guess,
+and upside-down scans aren't detected. (Vision LLMs turned out to be unreliable at telling upright from upside-down.)
 
 If a pull stalls near the end, restart Ollama (`sudo systemctl restart ollama`) and pull again — it resumes.
 
