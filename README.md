@@ -21,6 +21,12 @@ Fix any cells, add a title, then download as `.xlsx`. Nothing leaves your machin
   - mark the first row as a header
 - **Append rows** for tables that continue across pages (a repeated header row is skipped)
 - Optional table title, placed above the table in the spreadsheet
+- **Mutation register tab** for Punjab "Register Dakhil Kharij" pages: reads every page of a PDF (or page images)
+  into a fixed table — S.No., Award /mutation No, District, Tehsil, Mouza, Khata Khatuni, Katat, Kanal, Marla,
+  Sq ft OR Sarsai — with batch District/Tehsil/Mouza, cells to check highlighted, the cells it read outlined on the
+  page, a land total per award (Kanal/Marla/Sarsai carried up), and an Excel export with a live-formula Totals sheet
+  and a Review sheet. The form's ruled grid is located in code (the ١–١٧ column-number row gives every column), and
+  only the cells that matter — columns 1, 2, 14 and 17 — are read by the local models, one small cell at a time.
 - `.xlsx` export with real numbers (`12,450`, `12.3%`, `$1,200.50`, `(9,870)` keep their formatting), or copy as tab-separated text to paste into Excel
 - Optional LAN mode so other devices on your network can use it
 - **Translate tab**: Urdu, Punjabi (Shahmukhi and Gurmukhi) and Sindhi to English, using

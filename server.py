@@ -22,6 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 import pymupdf
+
+import mutation
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -401,6 +403,82 @@ def to_cell_value(s):
     return v, (None if fmt == "0" else fmt)
 
 
+MUTATION_HEADERS = ["S.No.", "Award /mutation No", "District", "Tehsil", "Mouza", "Khata Khatuni",
+                    "Katat", "Kanal", "Marla", "Sq ft OR Sarsai"]
+MARLA_PER_KANAL = 20
+THIRD_PER_MARLA = {"sarsai": 9, "sqft": 272}
+
+
+def build_mutation_xlsx(rows, unit, issues):
+    """Sheet1: the fixed-header table. Totals: land total per award with live formulas pointing at Sheet1,
+    so later edits in Excel carry through. Review: open issues, if any."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    head_font, fill = Font(bold=True), PatternFill("solid", fgColor="D9E1F2")
+    ws.append(MUTATION_HEADERS)
+    for c in ws[1]:
+        c.font, c.fill = head_font, fill
+    for i, row in enumerate(rows, start=1):
+        vals = [i] + [str(v).strip() for v in row[1:10]]
+        for j in (1, 6, 7, 8, 9):  # numeric columns
+            v = vals[j]
+            if re.fullmatch(r"\d+", v):
+                vals[j] = int(v)
+            elif re.fullmatch(r"\d+\.\d+", v):
+                vals[j] = float(v)
+        ws.append(vals)
+    for col, w in zip("ABCDEFGHIJ", (7, 20, 12, 14, 16, 28, 8, 8, 8, 16)):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A2"
+
+    per = THIRD_PER_MARLA.get(unit, 9)
+    third = "Sarsai" if unit != "sqft" else "Sq ft"
+    groups = {}
+    for row in rows:
+        key = tuple(str(v).strip() for v in (row[1], row[2], row[3], row[4]))
+        g = groups.setdefault(key, {"rows": 0})
+        g["rows"] += 1
+    if groups:
+        t = wb.create_sheet("Totals")
+        t.append(["Conversion rules", ""])
+        t.append(["Marla per Kanal", MARLA_PER_KANAL])
+        t.append([f"{third} per Marla", per])
+        t.append([])
+        hdr = ["Award /mutation No", "District", "Tehsil", "Mouza", "Rows", "Entered Kanal", "Entered Marla",
+               f"Entered {third}", f"Total in {third}", "Total Kanal", "Total Marla", f"Total {third}",
+               f"Total (Kanal-Marla-{third})"]
+        t.append(hdr)
+        for c in t[5]:
+            c.font, c.fill = head_font, fill
+        for n, (key, g) in enumerate(groups.items()):
+            r = 6 + n
+            award, district, tehsil, mouza = key
+            crit = f'Sheet1!$B:$B,$A{r},Sheet1!$C:$C,$B{r},Sheet1!$D:$D,$C{r},Sheet1!$E:$E,$D{r}'
+            t.append([int(award) if award.isdigit() else award, district, tehsil, mouza,
+                      f"=COUNTIFS({crit})", f"=SUMIFS(Sheet1!$H:$H,{crit})", f"=SUMIFS(Sheet1!$I:$I,{crit})",
+                      f"=SUMIFS(Sheet1!$J:$J,{crit})",
+                      f"=F{r}*$B$2*$B$3+G{r}*$B$3+H{r}",
+                      f"=INT(ROUND(I{r},4)/($B$2*$B$3))",
+                      f"=INT(MOD(ROUND(I{r},4),$B$2*$B$3)/$B$3)",
+                      f"=ROUND(MOD(ROUND(I{r},4),$B$3),2)",
+                      f'=J{r}&"-"&K{r}&"-"&L{r}'])
+        for col, w in zip("ABCDEFGHIJKLM", (20, 12, 14, 16, 7, 13, 13, 15, 15, 11, 11, 12, 26)):
+            t.column_dimensions[col].width = w
+    if issues:
+        rv = wb.create_sheet("Review")
+        rv.append(["S.No.", "Item"])
+        for c in rv[1]:
+            c.font, c.fill = head_font, fill
+        for s_no, text in issues:
+            rv.append([s_no, text])
+        rv.column_dimensions["A"].width, rv.column_dimensions["B"].width = 8, 100
+    wb.calculation.fullCalcOnLoad = True
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 def build_xlsx(title, rows, header, merges=()):
     wb = Workbook()
     ws = wb.active
@@ -576,6 +654,32 @@ class Handler(BaseHTTPRequestHandler):
                 out = "\n\n".join(ollama_generate(model, translate_prompt(src, tgt, c)) for c in chunk_text(text))
                 return self.send(200, {"ok": True, "translation": out, "original": text, "source": src,
                                        "seconds": round(time.time() - t0, 1), "model": model})
+
+            if url.path == "/api/mutation/read":
+                req = json.loads(self.body())
+                doc = self.get_doc(req["id"])
+                reader = req.get("model") or DEFAULT_MODEL
+                khata = req.get("khata_model") or TRANSLATE_MODEL
+
+                def ask(model, prompt, png):  # one small cell per call
+                    res = ollama_request("/api/chat", {
+                        "model": model, "stream": False, "keep_alive": "15m",
+                        "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 200},
+                        "messages": [{"role": "user", "content": prompt, "images": [base64.b64encode(png).decode()]}],
+                    }, timeout=600)
+                    return res.get("message", {}).get("content", "")
+
+                t0 = time.time()
+                out = mutation.read_page(doc[int(req["page"])], norm_rot(req.get("rot")), ask, reader, khata,
+                                         lock=DOCS_LOCK)  # held while rendering, released for model calls
+                out["seconds"] = round(time.time() - t0, 1)
+                return self.send(200, out)
+
+            if url.path == "/api/mutation/export":
+                req = json.loads(self.body())
+                data = build_mutation_xlsx(req.get("rows", []), req.get("unit", "sarsai"), req.get("issues", []))
+                return self.send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 {"Content-Disposition": 'attachment; filename="mutation-register.xlsx"'})
 
             if url.path == "/api/export":
                 req = json.loads(self.body())

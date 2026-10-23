@@ -37,7 +37,22 @@
   #drop.over { outline: 3px dashed var(--accent); outline-offset: -8px; }
   #tableWrap { flex: 1; overflow: auto; padding: 12px; }
   #title { width: 100%; font-size: 18px; font-weight: 600; text-align: center; margin-bottom: 10px; }
-  #gridBox { position: relative; outline: none; width: fit-content; min-width: 100%; }
+  .gridbox { position: relative; outline: none; width: fit-content; min-width: 100%; }
+  #mWrap { flex: 1; overflow: auto; padding: 12px; }
+  .mbatch input[type=text] { width: 9.5em; }
+  .sheet th.named { white-space: nowrap; color: var(--ink); font-weight: 600; font-size: 12px; padding: 4px 8px; }
+  .sheet td.sno { color: var(--muted); text-align: right; }
+  .sheet td.warn { background: color-mix(in srgb, #f5a623 22%, transparent); box-shadow: inset 0 0 0 1px #e0901a; }
+  .sheet td.cont { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .issues { margin: 10px 0 0; padding-left: 18px; font-size: 13px; color: #b06a00; }
+  @media (prefers-color-scheme: dark) { .issues { color: #f0b000; } }
+  h3.sub { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 18px 0 8px; }
+  table.totals { border-collapse: collapse; font-size: 13px; }
+  table.totals th, table.totals td { border: 1px solid var(--line); padding: 4px 10px; text-align: left; }
+  table.totals th { background: var(--bg); color: var(--muted); font-weight: 600; }
+  #cellBoxes { position: absolute; inset: 0; pointer-events: none; }
+  .cellbox { position: absolute; border: 2px solid #1b8a75; background: rgba(27,138,117,.08); }
+  .cellbox span { position: absolute; left: -2px; bottom: 100%; background: #1b8a75; color: #fff; font: 600 10px/1.4 system-ui, sans-serif; padding: 0 4px; border-radius: 3px 3px 0 0; white-space: nowrap; }
   table.sheet { border-collapse: collapse; min-width: 100%; user-select: none; }
   .sheet td { border: 1px solid var(--line); padding: 4px 6px; min-width: 60px; vertical-align: top; white-space: pre-wrap; outline: none; cursor: cell; }
   .sheet td.merged { vertical-align: middle; }
@@ -87,12 +102,13 @@
   <nav class="tabs" role="tablist">
     <button role="tab" data-tab="table" class="active">Table → Excel</button>
     <button role="tab" data-tab="translate">Translate</button>
+    <button role="tab" data-tab="mutation">Mutation register</button>
   </nav>
   <button class="primary" id="openBtn">Open image / PDF</button>
   <input type="file" id="file" accept=".pdf,image/*" hidden>
   <span id="fname" style="color:var(--muted)"></span>
   <span class="spacer"></span>
-  <label style="color:var(--muted)" class="for-table">Model <select id="model"></select></label>
+  <label style="color:var(--muted)" class="for-table for-mutation">Model <select id="model"></select></label>
   <label style="color:var(--muted)" class="for-translate" hidden>Model <select id="tModel"></select></label>
   <span id="spinner"></span>
   <span id="status">Starting…</span>
@@ -121,9 +137,14 @@
       <label class="for-table" title="Add rows to the current table (e.g. a table that continues on the next page)"><input type="radio" name="mode" value="append"> Append rows</label>
       <button class="primary for-translate" id="translateSel" disabled hidden>Translate selection</button>
       <label class="for-translate" hidden title="Add each translated selection below the previous one"><input type="checkbox" id="appendOut" checked> Add to output</label>
+      <button class="primary for-mutation" id="mReadPage" disabled hidden>Read this page</button>
+      <button class="for-mutation" id="mReadAll" disabled hidden>Read all pages</button>
+      <button class="for-mutation" id="mStop" hidden>Stop</button>
+      <span class="for-mutation muted" id="mProgress" hidden></span>
       <button id="clearSel" disabled>Clear selection</button>
     </div>
     <div class="hint for-table">Drag over the page to select the table region.</div>
+    <div class="hint for-mutation" hidden>Open Register Dakhil Kharij pages (PDF or images). Each page's columns 1, 2, 14 and 17 are found and read by the local model; the cells it read are outlined on the page.</div>
     <div class="hint for-translate" hidden>Drag over the page to select text. It is transcribed into “Original text” (fix any errors there), then translated. A paragraph or column at a time works best.</div>
     <div id="viewer">
       <div id="empty">Open or drop an image / PDF to begin.</div>
@@ -161,6 +182,35 @@
     </div>
   </section>
 
+  <section class="pane for-mutation" id="mutationPane" hidden>
+    <div class="bar mbatch">
+      <label>District <input type="text" id="mDistrict" placeholder="e.g. Multan"></label>
+      <label>Tehsil <input type="text" id="mTehsil" placeholder="e.g. Shujahabad"></label>
+      <label>Mouza <input type="text" id="mMouza" placeholder="e.g. Muqeempur"></label>
+      <label title="The third area figure in column 14">Third value <select id="mUnit"><option value="sarsai">Sarsai</option><option value="sqft">Sq ft</option></select></label>
+    </div>
+    <div class="hint" style="padding-top:8px">Batch details go on every row (edit a row's cell if a page is from somewhere else). 1 Kanal = 20 Marla · 1 Marla = 9 Sarsai · 1 Marla = 272 sq ft</div>
+    <div class="bar">
+      <span class="grp">
+        <button id="mUndo" title="Undo (Ctrl+Z)">↶</button>
+        <button id="mRedo" title="Redo (Ctrl+Y)">↷</button>
+      </span>
+      <button id="mAddRow" title="Insert a row below the selection (add an entry by hand)">+ Row</button>
+      <button id="mDelRow" title="Delete the selected rows">− Row</button>
+      <button id="mClear" title="Remove all rows">Clear all</button>
+      <span class="spacer"></span>
+      <button id="mCopy" title="Copy the table with headers (paste into Excel at A1)">Copy rows</button>
+      <button class="primary" id="mExport">Download Excel</button>
+    </div>
+    <div id="mWrap">
+      <div id="mGridBox" class="gridbox"></div>
+      <ul id="mIssues" class="issues"></ul>
+      <h3 class="sub">Land total by award</h3>
+      <table class="totals"><thead><tr><th>Award /mutation No</th><th>Rows</th><th>Kanal</th><th>Marla</th><th id="mThirdHd">Sarsai</th><th>Total (K-M-S)</th><th>Status</th></tr></thead><tbody id="mTotals"></tbody></table>
+      <p class="hint" style="padding:6px 0 0">Areas are added per award and carried up (Marla → Kanal, Sarsai/sq ft → Marla). The Excel file has the same totals with live formulas on a "Totals" sheet, and a "Review" sheet listing anything to check.</p>
+    </div>
+  </section>
+
   <section class="pane for-table" id="tablePane">
     <div class="bar">
       <span class="grp">
@@ -185,7 +235,7 @@
     <div class="hint" style="padding-top:8px">Drag to select cells · Shift+click to extend · drag the blue edge to move · double-click or type to edit · right-click for more · Alt+arrows move rows/columns</div>
     <div id="tableWrap">
       <input type="text" id="title" placeholder="Table title (optional)">
-      <div id="gridBox"></div>
+      <div id="gridBox" class="gridbox"></div>
     </div>
   </section>
 </main>
@@ -195,6 +245,8 @@
 const $ = s => document.querySelector(s);
 const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, busy: false, tab: 'table', rot: {}, shownRot: 0 };
 let grid = null;  // table editor (grid.js); holds the table data
+let mGrid = null; // mutation register table (fixed headers)
+const M = { flags: new Map(), notes: [], cells: {}, running: false, halt: false };  // flags: "award|khata" -> {col: note}
 
 function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
 function busy(on) { state.busy = on; $('#spinner').style.display = on ? 'inline-block' : 'none'; refreshButtons(); }
@@ -234,8 +286,7 @@ async function loadModels() {
 function setTab(tab) {
   state.tab = tab;
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  document.querySelectorAll('.for-table').forEach(el => el.hidden = tab !== 'table');
-  document.querySelectorAll('.for-translate').forEach(el => el.hidden = tab !== 'translate');
+  document.querySelectorAll('.for-table, .for-translate, .for-mutation').forEach(el => el.hidden = !el.classList.contains('for-' + tab));
   try { localStorage.setItem('tab', tab); } catch {}
   refreshButtons();
 }
@@ -277,7 +328,7 @@ async function showPage(n, fit = false) {
   state.shownRot = rot;
   const img = $('#pageImg');
   return new Promise(res => {
-    img.onload = () => { state.natW = img.naturalWidth; if (fit) fitZoom(); else applyZoom(); res(); };
+    img.onload = () => { state.natW = img.naturalWidth; if (fit) fitZoom(); else applyZoom(); drawCellBoxes(); res(); };
     img.onerror = () => { status('Could not render page', true); res(); };
     img.src = `/api/page?id=${state.doc}&n=${n}&dpi=150&rot=${rot}`;
     refreshButtons();
@@ -304,7 +355,7 @@ $('#prev').onclick = () => showPage(state.page - 1);
 $('#next').onclick = () => showPage(state.page + 1);
 $('#pageNo').onchange = e => { const n = parseInt(e.target.value, 10); if (n) showPage(n - 1); else e.target.value = state.page + 1; };
 document.addEventListener('keydown', e => {
-  if (!state.doc || e.target.closest('td, input, select, textarea, #gridBox')) return;
+  if (!state.doc || e.target.closest('td, input, select, textarea, .gridbox')) return;
   if (e.key === 'ArrowRight' || e.key === 'PageDown') showPage(state.page + 1);
   if (e.key === 'ArrowLeft' || e.key === 'PageUp') showPage(state.page - 1);
 });
@@ -440,8 +491,199 @@ $('#saveOut').onclick = () => {
   a.download = 'translation.txt'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 };
 
+/* ---------- mutation register ---------- */
+// Same job as the cloud "Mutation Register Extractor": read each register page, fill a fixed-header
+// table, flag what needs checking, total the land per award, export to Excel. Reading is done by the
+// server with the local models (see mutation.py).
+const M_HEAD = ['S.No.', 'Award /mutation No', 'District', 'Tehsil', 'Mouza', 'Khata Khatuni', 'Katat', 'Kanal', 'Marla', 'Sq ft OR Sarsai'];
+const isInt = v => /^\d+$/.test(String(v ?? '').trim()), isNum = v => /^\d+(\.\d+)?$/.test(String(v ?? '').trim());
+const normLoc = v => String(v ?? '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+const batch = () => ({ district: $('#mDistrict').value.trim(), tehsil: $('#mTehsil').value.trim(), mouza: $('#mMouza').value.trim() });
+const unitInfo = () => $('#mUnit').value === 'sqft' ? { label: 'Sq ft', per: 272 } : { label: 'Sarsai', per: 9 };
+const mKey = row => `${String(row[1]).trim()}|${String(row[5]).trim()}`;
+const isContinuation = row => (String(row[1]).trim() || String(row[5]).trim()) && [6, 7, 8, 9].every(c => !String(row[c]).trim());
+
+function rowIssues(row) {  // -> [[col or null, text]]
+  const out = [], k = String(row[5]).trim(), b = batch();
+  if (!isInt(row[1])) out.push([1, 'Award/mutation number missing']);
+  if (!k) out.push([5, 'Khata Khatuni missing']);
+  else {
+    if (!/^\d+(\s+to\s+\d+)?(\s*,\s*\d+(\s+to\s+\d+)?)*$/.test(k)) out.push([5, 'Khata Khatuni format looks wrong (expected e.g. "133, 440 to 444")']);
+    for (const m of k.matchAll(/(\d+)\s+to\s+(\d+)/g)) if (+m[2] < +m[1]) out.push([5, `Khata range runs backwards (${m[1]} to ${m[2]})`]);
+  }
+  if (isContinuation(row)) out.push([null, 'Continuation: the area columns are blank. Check that nothing needs adding.']);
+  else {
+    if (!isInt(row[6])) out.push([6, 'Katat missing']);
+    if (!isInt(row[7])) out.push([7, 'Kanal missing']);
+    if (!isInt(row[8])) out.push([8, 'Marla missing']);
+    if (!isNum(row[9])) out.push([9, `${unitInfo().label} missing`]);
+  }
+  [['district', 2, 'District'], ['tehsil', 3, 'Tehsil'], ['mouza', 4, 'Mouza']].forEach(([key, c, lab]) => {
+    if (b[key] && String(row[c]).trim() && normLoc(row[c]) !== normLoc(b[key])) out.push([c, `${lab} differs from the batch (${String(row[c]).trim()})`]);
+  });
+  const f = M.flags.get(mKey(row));
+  if (f) for (const [c, note] of Object.entries(f)) out.push([+c, `Model unsure: ${note}`]);
+  return out;
+}
+
+mGrid = createGrid({
+  box: $('#mGridBox'), colNames: M_HEAD, hasHeader: () => false, status: (m, err) => status(m, err),
+  onChange: () => mChanged(),
+  cellClass: (r, c, row) => {
+    if (c === 0) return 'sno';
+    if (rowIssues(row).some(([col]) => col === c)) return 'warn';
+    return isContinuation(row) && c >= 6 ? 'cont' : '';
+  },
+});
+function mChanged() { mGrid.renumber(0); mRenderIssues(); mRenderTotals(); refreshButtons(); }
+const mKeep = fn => () => { fn(); $('#mGridBox').focus({ preventScroll: true }); };
+$('#mUndo').onclick = mKeep(() => mGrid.undo());
+$('#mRedo').onclick = mKeep(() => mGrid.redo());
+$('#mAddRow').onclick = mKeep(() => {
+  const b = batch();
+  if (!mGrid.hasData()) mGrid.setData([['', '', b.district, b.tehsil, b.mouza, '', '', '', '', '']]);
+  else { mGrid.insertRowsBelow(); const x = mGrid.selection; mGrid.select([x.r1 + 1, 1]); }
+});
+$('#mDelRow').onclick = mKeep(() => mGrid.deleteRows());
+let mClearArmed = false;
+$('#mClear').onclick = e => {
+  if (!mClearArmed) { mClearArmed = true; e.target.textContent = 'Click again to clear'; setTimeout(() => { mClearArmed = false; e.target.textContent = 'Clear all'; }, 3000); return; }
+  mClearArmed = false; e.target.textContent = 'Clear all';
+  mGrid.clear(); M.flags.clear(); M.notes = []; M.cells = {}; drawCellBoxes(); mChanged(); status('Cleared (Ctrl+Z in the table brings the rows back).');
+};
+
+function mRenderIssues() {
+  const ul = $('#mIssues'); ul.innerHTML = '';
+  const add = text => { const li = document.createElement('li'); li.textContent = text; ul.append(li); };
+  M.notes.forEach(add);
+  mGrid.rows.forEach((row, i) => rowIssues(row).forEach(([, t]) => add(`S.No. ${i + 1}: ${t}`)));
+}
+function mTotals() {
+  const per = unitInfo().per, groups = new Map();
+  mGrid.rows.forEach(row => {
+    const award = String(row[1]).trim() || '(no award no.)', key = [award, ...[2, 3, 4].map(c => normLoc(row[c]))].join('|');
+    let g = groups.get(key);
+    if (!g) groups.set(key, g = { award, rows: 0, k: 0, m: 0, t: 0, area: false, flagged: 0 });
+    g.rows++;
+    if ([7, 8, 9].some(c => isNum(row[c]))) { g.area = true; g.k += +row[7] || 0; g.m += +row[8] || 0; g.t += +row[9] || 0; }
+    if (rowIssues(row).some(([, t]) => !t.startsWith('Continuation'))) g.flagged++;
+  });
+  return [...groups.values()].map(g => {  // carry up: third -> marla -> kanal
+    const units = Math.round((g.k * 20 * per + g.m * per + g.t) * 100), pk = 20 * per * 100, pm = per * 100;
+    const kanal = Math.floor(units / pk); let rest = units - kanal * pk; const marla = Math.floor(rest / pm); rest -= marla * pm;
+    return { ...g, kanal, marla, third: rest / 100 };
+  });
+}
+function mRenderTotals() {
+  const body = $('#mTotals'); body.innerHTML = '';
+  $('#mThirdHd').textContent = unitInfo().label;
+  for (const g of mTotals()) {
+    const tr = body.insertRow();
+    [g.award, g.rows, g.area ? g.kanal : '–', g.area ? g.marla : '–', g.area ? g.third : '–', g.area ? `${g.kanal}-${g.marla}-${g.third}` : '–',
+     g.flagged ? `${g.flagged} row${g.flagged === 1 ? '' : 's'} to check` : 'OK'].forEach(v => { tr.insertCell().textContent = v; });
+  }
+}
+
+// Batch details: remembered, and changing one updates the rows that still carry the old value.
+const mPrev = {};
+[['mDistrict', 2], ['mTehsil', 3], ['mMouza', 4]].forEach(([id, col]) => {
+  const el = $('#' + id);
+  try { el.value = localStorage.getItem('m.' + id) || ''; } catch {}
+  mPrev[id] = el.value.trim();
+  el.addEventListener('change', () => {
+    const now = el.value.trim(), old = mPrev[id];
+    try { localStorage.setItem('m.' + id, now); } catch {}
+    if (mGrid.hasData() && mGrid.rows.some(r => String(r[col]).trim() === old))
+      mGrid.setData(mGrid.rows.map(r => r.map((v, c) => c === col && String(v).trim() === old ? now : v)));
+    mPrev[id] = now; mChanged();
+  });
+});
+try { $('#mUnit').value = localStorage.getItem('m.unit') || 'sarsai'; } catch {}
+$('#mUnit').onchange = () => { try { localStorage.setItem('m.unit', $('#mUnit').value); } catch {} mGrid.render(); mChanged(); };
+
+// Outline the cells that were read on the page (only while their rotation still matches).
+const CELL_TAG = { 1: 'Award', 2: 'Khata', 14: 'Area', 17: 'Katat' };
+function drawCellBoxes() {
+  let layer = $('#cellBoxes');
+  if (!layer) { layer = document.createElement('div'); layer.id = 'cellBoxes'; layer.className = 'for-mutation'; layer.hidden = state.tab !== 'mutation'; $('#stage').append(layer); }
+  layer.innerHTML = '';
+  const c = M.cells[state.page];
+  if (!c || c.rot !== rotOf(state.page)) return;
+  for (const { col, r } of c.boxes) {
+    const d = document.createElement('div'); d.className = 'cellbox';
+    Object.assign(d.style, { left: r[0] * 100 + '%', top: r[1] * 100 + '%', width: (r[2] - r[0]) * 100 + '%', height: (r[3] - r[1]) * 100 + '%' });
+    d.innerHTML = `<span>${CELL_TAG[col]}</span>`; layer.append(d);
+  }
+}
+
+async function mRead(pages) {
+  if (!state.doc || M.running) return;
+  M.running = true; M.halt = false; refreshButtons();
+  const b = batch(), model = $('#model').value;
+  let added = 0, failed = 0;
+  for (const n of pages) {
+    if (M.halt) break;
+    await showPage(n);
+    $('#mProgress').textContent = pages.length > 1 ? `Page ${n + 1} (${pages.indexOf(n) + 1} of ${pages.length})…` : `Reading page ${n + 1}…`;
+    status(`Reading page ${n + 1} with the local models… (the first page loads the models, ~30 s)`);
+    let j;
+    try { j = await api('/api/mutation/read', { method: 'POST', body: JSON.stringify({ id: state.doc, page: n, rot: rotOf(n), model }) }); }
+    catch (e) { M.notes.push(`Page ${n + 1}: ${e.message}`); failed++; continue; }
+    M.notes = M.notes.filter(t => !t.startsWith(`Page ${n + 1}:`));
+    if (!j.ok) { M.notes.push(`Page ${n + 1}: ${j.error}`); failed++; mRenderIssues(); continue; }
+    if (!j.records.length) M.notes.push(`Page ${n + 1}: no mutation entry found (blank, cover or index page?).`);
+    M.cells[n] = { rot: rotOf(n), boxes: j.records.flatMap(rec => Object.entries(rec.cells).map(([col, r]) => ({ col: +col, r }))) };
+    drawCellBoxes();
+    const existing = new Set(mGrid.rows.map(mKey)), rows = [];
+    for (const rec of j.records) {
+      const row = ['', rec.award, b.district, b.tehsil, b.mouza, rec.khata, rec.katat, rec.kanal, rec.marla, rec.sarsai];
+      if (existing.has(mKey(row))) { M.notes.push(`Page ${n + 1}: award ${rec.award} (khata ${rec.khata}) is already in the table — not added again.`); continue; }
+      const cols = { award: [1], khata: [5], katat: [6], area: [7, 8, 9] }, f = {};
+      (rec.flags || []).forEach(k => (cols[k] || []).forEach(c => { f[c] = rec.notes; }));
+      if (Object.keys(f).length) M.flags.set(mKey(row), f);
+      rows.push(row);
+    }
+    if (rows.length) { mGrid.appendRows(rows); added += rows.length; }
+    mChanged();
+    status(`Page ${n + 1}: ${j.records.length} entr${j.records.length === 1 ? 'y' : 'ies'} read in ${j.seconds}s.`);
+  }
+  M.running = false; $('#mProgress').textContent = ''; refreshButtons();
+  status(`${M.halt ? 'Stopped. ' : 'Done. '}${added} row${added === 1 ? '' : 's'} added${failed ? `, ${failed} page${failed === 1 ? '' : 's'} could not be read` : ''}. Check the highlighted cells against the outlined cells on the page.`, failed > 0);
+}
+$('#mReadPage').onclick = () => mRead([state.page]);
+$('#mReadAll').onclick = () => mRead([...Array(state.pages).keys()]);
+$('#mStop').onclick = () => { M.halt = true; status('Stopping after the current page…'); };
+
+function mIssueList() {
+  const out = M.notes.map(t => ['', t]);
+  mGrid.rows.forEach((row, i) => rowIssues(row).forEach(([, t]) => out.push([i + 1, t])));
+  return out;
+}
+$('#mExport').onclick = async () => {
+  try {
+    const r = await api('/api/mutation/export', { method: 'POST', body: JSON.stringify({ rows: mGrid.rows, unit: $('#mUnit').value, issues: mIssueList() }) });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(await r.blob());
+    a.download = `mutation-register-${new Date().toISOString().slice(0, 10)}.xlsx`;
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    status('Saved ' + a.download);
+  } catch (e) { status(e.message, true); }
+};
+$('#mCopy').onclick = async () => {
+  const text = [M_HEAD, ...mGrid.rows].map(r => r.join('\t')).join('\n');
+  try { await navigator.clipboard.writeText(text); status('Copied. Paste into Excel at cell A1.'); } catch { status('Clipboard not available — use Download Excel.', true); }
+};
+
 function refreshButtons() {
   const has = !!state.doc;
+  if (mGrid) {
+    $('#mReadPage').disabled = !has || M.running || state.busy;
+    $('#mReadAll').disabled = !has || M.running || state.busy;
+    $('#mStop').hidden = !M.running || state.tab !== 'mutation';
+    $('#mProgress').hidden = !M.running || state.tab !== 'mutation';
+    for (const id of ['mExport', 'mCopy', 'mDelRow', 'mClear']) $('#' + id).disabled = !mGrid.hasData() || M.running;
+    $('#mUndo').disabled = !mGrid.canUndo(); $('#mRedo').disabled = !mGrid.canRedo();
+  }
   $('#translateSel').disabled = !has || !state.sel || state.busy;
   $('#translateText').disabled = !$('#srcText').value.trim() || state.busy;
   $('#prev').disabled = !has || state.page <= 0;
@@ -456,7 +698,7 @@ function refreshButtons() {
 window.addEventListener('resize', drawSel);
 let savedTab = 'table';
 try { savedTab = localStorage.getItem('tab') || 'table'; } catch {}
-setTab(savedTab === 'translate' ? 'translate' : 'table');
+setTab(['translate', 'mutation'].includes(savedTab) ? savedTab : 'table');
 loadModels().catch(e => status(e.message, true));
 </script>
 </body>

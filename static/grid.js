@@ -4,7 +4,10 @@
 
    Data model: rows = string[][] (always rectangular), merges = [{r, c, rs, cs}] where (r, c) is the
    top-left cell and rs/cs the row/column span. Cells covered by a merge keep "" and aren't rendered. */
-function createGrid({ box, onChange, status, hasHeader }) {
+function createGrid({ box, onChange, status, hasHeader, colNames = null, cellClass = null }) {
+  // colNames: fixed column headings shown instead of A, B, C… — the column set is then locked
+  // (no inserting, deleting or reordering columns; pastes are trimmed to fit).
+  const fixedCols = !!colNames;
   let rows = [], merges = [];
   let anchor = [0, 0], focus = [0, 0];       // selection = rectangle spanned by anchor..focus (+ merges)
   let editing = null;                         // {r, c, td, before}
@@ -60,6 +63,7 @@ function createGrid({ box, onChange, status, hasHeader }) {
   function restore(s) { ({ rows, merges } = JSON.parse(s)); setSel(anchor, focus); render(); changed(); }
   function changed() { onChange && onChange(); }
   function ensure(h, w) {  // grow the table to at least h x w
+    if (fixedCols) w = colNames.length;
     while (nR() < h) rows.push(Array(Math.max(nC(), w)).fill(''));
     if (nC() < w) rows.forEach(row => { while (row.length < w) row.push(''); });
   }
@@ -72,7 +76,8 @@ function createGrid({ box, onChange, status, hasHeader }) {
     const head = table.createTHead().insertRow();
     const corner = document.createElement('th'); corner.className = 'corner'; corner.title = 'Select all'; head.append(corner);
     for (let c = 0; c < nC(); c++) {
-      const th = document.createElement('th'); th.className = 'ch'; th.dataset.c = c; th.textContent = colName(c); head.append(th);
+      const th = document.createElement('th'); th.className = 'ch' + (fixedCols ? ' named' : ''); th.dataset.c = c;
+      th.textContent = fixedCols ? colNames[c] : colName(c); head.append(th);
     }
     const body = table.createTBody();
     rows.forEach((row, r) => {
@@ -85,6 +90,7 @@ function createGrid({ box, onChange, status, hasHeader }) {
         const m = mergeAt(r, c);
         if (m) { td.rowSpan = m.rs; td.colSpan = m.cs; td.classList.add('merged'); }
         td.dataset.r = r; td.dataset.c = c; td.textContent = val;
+        if (cellClass) { const cls = cellClass(r, c, rows[r]); if (cls) td.classList.add(...cls.split(' ')); }
         if (/^[\s؀-ۿݐ-ݿ]*[؀-ۿ]/.test(val)) td.dir = 'rtl';
       });
     });
@@ -169,6 +175,7 @@ function createGrid({ box, onChange, status, hasHeader }) {
   }
   // Insert/delete along one axis; `axis` 'r' or 'c'.
   function insertAt(axis, at, n) {
+    if (axis === 'c' && fixedCols) return status('This table has fixed columns.');
     record();
     if (axis === 'r') rows.splice(at, 0, ...blank(n, nC()));
     else rows.forEach(row => row.splice(at, 0, ...Array(n).fill('')));
@@ -177,6 +184,7 @@ function createGrid({ box, onChange, status, hasHeader }) {
     render(); changed();
   }
   function deleteRange(axis, a, b) {
+    if (axis === 'c' && fixedCols) return status('This table has fixed columns.');
     const n = b - a + 1, total = axis === 'r' ? nR() : nC();
     if (n >= total) return status(`Can't delete every ${axis === 'r' ? 'row' : 'column'} — use Clear instead.`);
     record();
@@ -198,6 +206,7 @@ function createGrid({ box, onChange, status, hasHeader }) {
   function moveBlock(dr, dc) {
     const x = sel();
     dr = Math.max(dr, -x.r0); dc = Math.max(dc, -x.c0);
+    if (fixedCols) dc = Math.min(dc, nC() - 1 - x.c1);
     if (!dr && !dc) return;
     const h = x.r1 - x.r0 + 1, w = x.c1 - x.c0 + 1;
     const dst = { r0: x.r0 + dr, c0: x.c0 + dc, r1: x.r1 + dr, c1: x.c1 + dc };
@@ -214,6 +223,7 @@ function createGrid({ box, onChange, status, hasHeader }) {
   }
   // Reorder whole rows/columns: shift the selected ones one step (dir = -1 / +1).
   function shiftLines(axis, dir) {
+    if (axis === 'c' && fixedCols) return status('This table has fixed columns.');
     const x = sel();
     const [a, b] = axis === 'r' ? [x.r0, x.r1] : [x.c0, x.c1];
     const total = axis === 'r' ? nR() : nC();
@@ -257,8 +267,9 @@ function createGrid({ box, onChange, status, hasHeader }) {
   }
   function paste(text) {
     const data = parseTSV(text);
-    const h = data.length, w = Math.max(...data.map(r => r.length));
-    const x = sel(), r0 = x.r0, c0 = x.c0;
+    const h = data.length, x = sel(), r0 = x.r0, c0 = x.c0;
+    let w = Math.max(...data.map(r => r.length));
+    if (fixedCols) w = Math.min(w, nC() - c0);  // trim what doesn't fit
     record();
     ensure(r0 + h, c0 + w);
     const dst = { r0, c0, r1: r0 + h - 1, c1: c0 + w - 1 };
@@ -368,7 +379,8 @@ function createGrid({ box, onChange, status, hasHeader }) {
     if (!e.target.closest('td, th') || editing) return;
     e.preventDefault();
     menu.innerHTML = '';
-    for (const it of ITEMS) {
+    const items = fixedCols ? ITEMS.filter(it => it === '-' || !/column/i.test(it[0])) : ITEMS;
+    for (const it of items) {
       if (it === '-') { menu.append(Object.assign(document.createElement('hr'))); continue; }
       const b = document.createElement('button');
       b.innerHTML = `<span>${it[0]}</span><kbd>${it[1]}</kbd>`;
@@ -450,19 +462,26 @@ function createGrid({ box, onChange, status, hasHeader }) {
     canRedo: () => redo.length > 0,
     setData(newRows, newMerges = []) {
       if (nR()) record();
-      const w = Math.max(1, ...newRows.map(r => r.length));
+      const w = fixedCols ? colNames.length : Math.max(1, ...newRows.map(r => r.length));
       rows = newRows.map(r => r.concat(Array(w - r.length).fill('')));
       merges = newMerges; anchor = [0, 0]; focus = [0, 0];
       render(); changed();
     },
     appendRows(more) {
       record();
-      const w = Math.max(nC(), ...more.map(r => r.length));
+      const w = fixedCols ? colNames.length : Math.max(nC(), ...more.map(r => r.length));
       ensure(nR(), w);
       more.forEach(r => rows.push(r.concat(Array(w - r.length).fill(''))));
       render(); changed();
     },
-    ensureTable() { if (!nR()) { rows = blank(3, 3); render(); changed(); } },
+    ensureTable() { if (!nR()) { rows = blank(fixedCols ? 1 : 3, fixedCols ? colNames.length : 3); render(); changed(); } },
+    // Keep a running number in column `c` (e.g. S.No.). Not an undoable edit; re-renders only if needed.
+    renumber(c) {
+      let dirty = false;
+      rows.forEach((row, i) => { if (row[c] !== String(i + 1)) { row[c] = String(i + 1); dirty = true; } });
+      if (dirty) render();
+    },
+    clear() { if (nR()) record(); rows = []; merges = []; render(); changed(); },
     render,
     undo() { if (!undo.length) return; redo.push(snapshot()); restore(undo.pop()); },
     redo() { if (!redo.length) return; undo.push(snapshot()); restore(redo.pop()); },
