@@ -52,6 +52,9 @@
   table.totals th { background: var(--bg); color: var(--muted); font-weight: 600; }
   #cellBoxes { position: absolute; inset: 0; pointer-events: none; }
   .cellbox { position: absolute; border: 2px solid #1b8a75; background: rgba(27,138,117,.08); }
+  .cellbox.loc { border-color: #2f6fdb; background: rgba(47,111,219,.08); }
+  .cellbox.loc span { background: #2f6fdb; }
+  .sheet td.loc { background: color-mix(in srgb, #2f6fdb 14%, transparent); }
   .cellbox span { position: absolute; left: -2px; bottom: 100%; background: #1b8a75; color: #fff; font: 600 10px/1.4 system-ui, sans-serif; padding: 0 4px; border-radius: 3px 3px 0 0; white-space: nowrap; }
   table.sheet { border-collapse: collapse; min-width: 100%; user-select: none; }
   .sheet td { border: 1px solid var(--line); padding: 4px 6px; min-width: 60px; vertical-align: top; white-space: pre-wrap; outline: none; cursor: cell; }
@@ -187,9 +190,10 @@
       <label>District <input type="text" id="mDistrict" placeholder="e.g. Multan"></label>
       <label>Tehsil <input type="text" id="mTehsil" placeholder="e.g. Shujahabad"></label>
       <label>Mouza <input type="text" id="mMouza" placeholder="e.g. Muqeempur"></label>
+      <label title="Katat: the small number under the column 17 total. Khasra No.: the number under the bars in column 16 — use it for registers that list khasra numbers instead of a katat.">Plot column <select id="mPlot"><option value="katat">Katat</option><option value="khasra">Khasra No.</option></select></label>
       <label title="The third area figure in column 14">Third value <select id="mUnit"><option value="sarsai">Sarsai</option><option value="sqft">Sq ft</option></select></label>
     </div>
-    <div class="hint" style="padding-top:8px">Batch details go on every row (edit a row's cell if a page is from somewhere else). 1 Kanal = 20 Marla · 1 Marla = 9 Sarsai · 1 Marla = 272 sq ft</div>
+    <div class="hint" style="padding-top:8px">Batch details go on every row, shown in <span style="color:#2f6fdb;font-weight:600">blue</span> — check them against the blue box outlining the page header, and edit a row's cell if a page is from somewhere else. 1 Kanal = 20 Marla · 1 Marla = 9 Sarsai · 1 Marla = 272 sq ft</div>
     <div class="bar">
       <span class="grp">
         <button id="mUndo" title="Undo (Ctrl+Z)">↶</button>
@@ -499,6 +503,7 @@ const M_HEAD = ['S.No.', 'Award /mutation No', 'District', 'Tehsil', 'Mouza', 'K
 const isInt = v => /^\d+$/.test(String(v ?? '').trim()), isNum = v => /^\d+(\.\d+)?$/.test(String(v ?? '').trim());
 const normLoc = v => String(v ?? '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 const batch = () => ({ district: $('#mDistrict').value.trim(), tehsil: $('#mTehsil').value.trim(), mouza: $('#mMouza').value.trim() });
+const plotField = () => $('#mPlot').value;  // 'katat' or 'khasra': what column 7 of the table holds
 const unitInfo = () => $('#mUnit').value === 'sqft' ? { label: 'Sq ft', per: 272 } : { label: 'Sarsai', per: 9 };
 const mKey = row => `${String(row[1]).trim()}|${String(row[5]).trim()}`;
 const isContinuation = row => (String(row[1]).trim() || String(row[5]).trim()) && [6, 7, 8, 9].every(c => !String(row[c]).trim());
@@ -513,7 +518,8 @@ function rowIssues(row) {  // -> [[col or null, text]]
   }
   if (isContinuation(row)) out.push([null, 'Continuation: the area columns are blank. Check that nothing needs adding.']);
   else {
-    if (!isInt(row[6])) out.push([6, 'Katat missing']);
+    if (plotField() === 'khasra') { if (!/\d/.test(String(row[6]))) out.push([6, 'Khasra No. missing']); }
+    else if (!isInt(row[6])) out.push([6, 'Katat missing']);
     if (!isInt(row[7])) out.push([7, 'Kanal missing']);
     if (!isInt(row[8])) out.push([8, 'Marla missing']);
     if (!isNum(row[9])) out.push([9, `${unitInfo().label} missing`]);
@@ -522,7 +528,11 @@ function rowIssues(row) {  // -> [[col or null, text]]
     if (b[key] && String(row[c]).trim() && normLoc(row[c]) !== normLoc(b[key])) out.push([c, `${lab} differs from the batch (${String(row[c]).trim()})`]);
   });
   const f = M.flags.get(mKey(row));
-  if (f) for (const [c, note] of Object.entries(f)) out.push([+c, `Model unsure: ${note}`]);
+  if (f) for (const [c, note] of Object.entries(f)) {
+    // Only when it adds something: not on a cell already flagged, nor the blank area cells of a continuation.
+    if (out.some(([col]) => col === +c) || (isContinuation(row) && +c >= 6)) continue;
+    out.push([+c, `Model unsure: ${note}`]);
+  }
   return out;
 }
 
@@ -532,6 +542,7 @@ mGrid = createGrid({
   cellClass: (r, c, row) => {
     if (c === 0) return 'sno';
     if (rowIssues(row).some(([col]) => col === c)) return 'warn';
+    if (c >= 2 && c <= 4) return 'loc';  // from the batch details: check against the blue box on the page
     return isContinuation(row) && c >= 6 ? 'cont' : '';
   },
 });
@@ -599,10 +610,18 @@ const mPrev = {};
   });
 });
 try { $('#mUnit').value = localStorage.getItem('m.unit') || 'sarsai'; } catch {}
+function applyPlotField() { M_HEAD[6] = plotField() === 'khasra' ? 'Khasra No.' : 'Katat'; mGrid.render(); mChanged(); }
+try { $('#mPlot').value = localStorage.getItem('m.plot') || 'katat'; } catch {}
+$('#mPlot').onchange = () => {
+  try { localStorage.setItem('m.plot', plotField()); } catch {}
+  applyPlotField();
+  if (mGrid.hasData()) status(`Column header changed to "${M_HEAD[6]}". Rows already read keep their values — read the pages again to fill it from the other column.`);
+};
+applyPlotField();
 $('#mUnit').onchange = () => { try { localStorage.setItem('m.unit', $('#mUnit').value); } catch {} mGrid.render(); mChanged(); };
 
 // Outline the cells that were read on the page (only while their rotation still matches).
-const CELL_TAG = { 1: 'Award', 2: 'Khata', 14: 'Area', 17: 'Katat' };
+const CELL_TAG = { 1: 'Award', 2: 'Khata', 14: 'Area', 16: 'Khasra', 17: 'Katat', loc: 'District · Tehsil · Mouza' };
 function drawCellBoxes() {
   let layer = $('#cellBoxes');
   if (!layer) { layer = document.createElement('div'); layer.id = 'cellBoxes'; layer.className = 'for-mutation'; layer.hidden = state.tab !== 'mutation'; $('#stage').append(layer); }
@@ -610,7 +629,7 @@ function drawCellBoxes() {
   const c = M.cells[state.page];
   if (!c || c.rot !== rotOf(state.page)) return;
   for (const { col, r } of c.boxes) {
-    const d = document.createElement('div'); d.className = 'cellbox';
+    const d = document.createElement('div'); d.className = 'cellbox' + (col === 'loc' ? ' loc' : '');
     Object.assign(d.style, { left: r[0] * 100 + '%', top: r[1] * 100 + '%', width: (r[2] - r[0]) * 100 + '%', height: (r[3] - r[1]) * 100 + '%' });
     d.innerHTML = `<span>${CELL_TAG[col]}</span>`; layer.append(d);
   }
@@ -620,35 +639,47 @@ async function mRead(pages) {
   if (!state.doc || M.running) return;
   M.running = true; M.halt = false; refreshButtons();
   const b = batch(), model = $('#model').value;
-  let added = 0, failed = 0;
+  let added = 0, failed = 0, filledAll = 0;
   for (const n of pages) {
     if (M.halt) break;
     await showPage(n);
     $('#mProgress').textContent = pages.length > 1 ? `Page ${n + 1} (${pages.indexOf(n) + 1} of ${pages.length})…` : `Reading page ${n + 1}…`;
     status(`Reading page ${n + 1} with the local models… (the first page loads the models, ~30 s)`);
     let j;
-    try { j = await api('/api/mutation/read', { method: 'POST', body: JSON.stringify({ id: state.doc, page: n, rot: rotOf(n), model }) }); }
+    try { j = await api('/api/mutation/read', { method: 'POST', body: JSON.stringify({ id: state.doc, page: n, rot: rotOf(n), model, plot: plotField() }) }); }
     catch (e) { M.notes.push(`Page ${n + 1}: ${e.message}`); failed++; continue; }
     M.notes = M.notes.filter(t => !t.startsWith(`Page ${n + 1}:`));
     if (!j.ok) { M.notes.push(`Page ${n + 1}: ${j.error}`); failed++; mRenderIssues(); continue; }
     if (!j.records.length) M.notes.push(`Page ${n + 1}: no mutation entry found (blank, cover or index page?).`);
     M.cells[n] = { rot: rotOf(n), boxes: j.records.flatMap(rec => Object.entries(rec.cells).map(([col, r]) => ({ col: +col, r }))) };
+    if (j.location && j.records.length) M.cells[n].boxes.push({ col: 'loc', r: j.location });
     drawCellBoxes();
-    const existing = new Set(mGrid.rows.map(mKey)), rows = [];
+    const rows = [];
+    let table = mGrid.rows.map(r => [...r]), filled = 0;
     for (const rec of j.records) {
       const row = ['', rec.award, b.district, b.tehsil, b.mouza, rec.khata, rec.katat, rec.kanal, rec.marla, rec.sarsai];
-      if (existing.has(mKey(row))) { M.notes.push(`Page ${n + 1}: award ${rec.award} (khata ${rec.khata}) is already in the table — not added again.`); continue; }
       const cols = { award: [1], khata: [5], katat: [6], area: [7, 8, 9] }, f = {};
       (rec.flags || []).forEach(k => (cols[k] || []).forEach(c => { f[c] = rec.notes; }));
-      if (Object.keys(f).length) M.flags.set(mKey(row), f);
+      if (Object.keys(f).length) M.flags.set(mKey(row), f); else M.flags.delete(mKey(row));  // latest read wins
+      const same = table.find(r => mKey(r) === mKey(row));
+      if (same) {
+        // Already in the table (page read again, e.g. after switching Katat/Khasra): fill only the cells
+        // that are still empty, so nothing typed or corrected by hand is overwritten.
+        let n2 = 0;
+        row.forEach((v, c) => { if (c > 0 && String(v ?? '').trim() && !String(same[c] ?? '').trim()) { same[c] = v; n2++; } });
+        filled += n2;
+        if (!n2) M.notes.push(`Page ${n + 1}: award ${rec.award} (khata ${rec.khata}) is already in the table — nothing new to fill in.`);
+        continue;
+      }
       rows.push(row);
     }
+    if (filled) { mGrid.setData(table); filledAll += filled; }  // one undoable step
     if (rows.length) { mGrid.appendRows(rows); added += rows.length; }
     mChanged();
-    status(`Page ${n + 1}: ${j.records.length} entr${j.records.length === 1 ? 'y' : 'ies'} read in ${j.seconds}s.`);
+    status(`Page ${n + 1}: ${j.records.length} entr${j.records.length === 1 ? 'y' : 'ies'} read in ${j.seconds}s${filled ? `, ${filled} empty cell${filled === 1 ? '' : 's'} filled in an existing row` : ''}.`);
   }
   M.running = false; $('#mProgress').textContent = ''; refreshButtons();
-  status(`${M.halt ? 'Stopped. ' : 'Done. '}${added} row${added === 1 ? '' : 's'} added${failed ? `, ${failed} page${failed === 1 ? '' : 's'} could not be read` : ''}. Check the highlighted cells against the outlined cells on the page.`, failed > 0);
+  status(`${M.halt ? 'Stopped. ' : 'Done. '}${added} row${added === 1 ? '' : 's'} added${filledAll ? `, ${filledAll} empty cell${filledAll === 1 ? '' : 's'} filled in existing rows` : ''}${failed ? `, ${failed} page${failed === 1 ? '' : 's'} could not be read` : ''}. Check the highlighted cells against the outlined cells on the page.`, failed > 0);
 }
 $('#mReadPage').onclick = () => mRead([state.page]);
 $('#mReadAll').onclick = () => mRead([...Array(state.pages).keys()]);
@@ -661,7 +692,7 @@ function mIssueList() {
 }
 $('#mExport').onclick = async () => {
   try {
-    const r = await api('/api/mutation/export', { method: 'POST', body: JSON.stringify({ rows: mGrid.rows, unit: $('#mUnit').value, issues: mIssueList() }) });
+    const r = await api('/api/mutation/export', { method: 'POST', body: JSON.stringify({ rows: mGrid.rows, unit: $('#mUnit').value, issues: mIssueList(), plot: plotField() }) });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(await r.blob());
     a.download = `mutation-register-${new Date().toISOString().slice(0, 10)}.xlsx`;

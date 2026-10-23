@@ -409,14 +409,17 @@ MARLA_PER_KANAL = 20
 THIRD_PER_MARLA = {"sarsai": 9, "sqft": 272}
 
 
-def build_mutation_xlsx(rows, unit, issues):
+def build_mutation_xlsx(rows, unit, issues, plot="katat"):
     """Sheet1: the fixed-header table. Totals: land total per award with live formulas pointing at Sheet1,
     so later edits in Excel carry through. Review: open issues, if any."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Sheet1"
     head_font, fill = Font(bold=True), PatternFill("solid", fgColor="D9E1F2")
-    ws.append(MUTATION_HEADERS)
+    headers = list(MUTATION_HEADERS)
+    if plot == "khasra":
+        headers[6] = "Khasra No."
+    ws.append(headers)
     for c in ws[1]:
         c.font, c.fill = head_font, fill
     for i, row in enumerate(rows, start=1):
@@ -659,7 +662,6 @@ class Handler(BaseHTTPRequestHandler):
                 req = json.loads(self.body())
                 doc = self.get_doc(req["id"])
                 reader = req.get("model") or DEFAULT_MODEL
-                khata = req.get("khata_model") or TRANSLATE_MODEL
 
                 def ask(model, prompt, png):  # one small cell per call
                     res = ollama_request("/api/chat", {
@@ -670,14 +672,16 @@ class Handler(BaseHTTPRequestHandler):
                     return res.get("message", {}).get("content", "")
 
                 t0 = time.time()
-                out = mutation.read_page(doc[int(req["page"])], norm_rot(req.get("rot")), ask, reader, khata,
-                                         lock=DOCS_LOCK)  # held while rendering, released for model calls
+                out = mutation.read_page(doc[int(req["page"])], norm_rot(req.get("rot")), ask, reader,
+                                         TRANSLATE_MODEL, lock=DOCS_LOCK,
+                                         plot_field="khasra" if req.get("plot") == "khasra" else "katat")  # held while rendering, released for model calls
                 out["seconds"] = round(time.time() - t0, 1)
                 return self.send(200, out)
 
             if url.path == "/api/mutation/export":
                 req = json.loads(self.body())
-                data = build_mutation_xlsx(req.get("rows", []), req.get("unit", "sarsai"), req.get("issues", []))
+                data = build_mutation_xlsx(req.get("rows", []), req.get("unit", "sarsai"), req.get("issues", []),
+                                           req.get("plot", "katat"))
                 return self.send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                  {"Content-Disposition": 'attachment; filename="mutation-register.xlsx"'})
 

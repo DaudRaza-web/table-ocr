@@ -14,6 +14,8 @@ values are parsed with plain rules:
   header     ضلع / تحصیل / محال (District / Tehsil / Mouza)
 """
 import contextlib
+import itertools
+import math
 import re
 
 import pymupdf
@@ -23,10 +25,6 @@ INK_MIN = 0.004     # a cell with less ink than this is treated as empty
 
 PROMPT_PLAIN = ("Transcribe all text in this image exactly as written, top to bottom, one line per printed line. "
                 "Keep digits, hyphens and slashes exactly. Output only the text.")
-PROMPT_KHATA = ("This image is one cell from an Urdu land register. It holds a vertical list of khata numbers. "
-                "Between two numbers there may be the short Urdu word تا (it means 'to' and marks a range). "
-                "Write each printed line on its own line, top to bottom. Write numbers with Western digits. "
-                "Wherever the word تا appears, write the word TO on that line instead. Output only the lines.")
 
 EASTERN = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 KMS = re.compile(r"(\d+)\s*[-–]\s*(\d+)\s*[-–]\s*(\d+(?:\.\d+)?)")
@@ -57,30 +55,26 @@ def parse_total_katat(text):
     return m.group(0), (k.group(1) if k else "")
 
 
+def parse_khasra(text):
+    """Column 16 lists khasra entries like '47/9/2/1' with the short number printed under its bar
+    ('47'). Return the under-bar numbers, unique and in order ('47', or '47, 48'). If none were read,
+    fall back to the leading part of the full numbers, which carries the same value."""
+    lines = [ln.strip() for ln in _norm(text).splitlines() if ln.strip()]
+    under = [ln for ln in lines if re.fullmatch(r"\d{1,5}", ln)]
+    leading = [m.group(1) for ln in lines if (m := re.match(r"(\d{1,5})\s*/", ln))]
+    if leading:
+        # The under-bar number repeats the full number's leading part; anything else is a stray
+        # (e.g. the tail of a long number that wrapped onto its own line).
+        under = [n for n in under if n in leading] or leading
+    return ", ".join(dict.fromkeys(under))
+
+
 def _plain_numbers(text):
     """Whole numbers in a transcription, skipping fractions (26/1601), CNIC-style IDs and K-M-S areas."""
     t = KMS.sub(" ", _norm(text))
     t = re.sub(r"\d+\s*/\s*\d+", " ", t)
     t = re.sub(r"\d+(?:-\d+){1,}", " ", t)
     return [int(n) for n in re.findall(r"(?<!\d)(\d{1,6})(?!\d)", t)]
-
-
-def parse_khata(text):
-    """'133 / 440 / TO / 444' -> [(133, None), (440, 444)]."""
-    items, pending_to = [], False
-    t = re.sub(r"\bto\b|تا", " TO ", _norm(text), flags=re.I)
-    t = re.sub(r"\d+\s*/\s*\d+", " ", t)
-    for tok in re.findall(r"TO|\d{1,6}", t):
-        if tok == "TO":
-            pending_to = bool(items) and items[-1][1] is None
-            continue
-        n = int(tok)
-        if pending_to:
-            items[-1] = (items[-1][0], n)
-            pending_to = False
-        else:
-            items.append((n, None))
-    return items
 
 
 def format_khata(items):
@@ -102,6 +96,63 @@ def _group(idxs, gap=3):
     return [(g[0] + g[-1]) // 2 for g in out]
 
 
+def estimate_skew(page, rot=0):
+    """Small scan tilt in degrees (positive = content slopes down to the right). Projection-profile
+    method: rows of a straight table/text give the 'peakiest' row histogram; try angles, keep the best."""
+    z = 1000 / max(page.rect.width, page.rect.height)
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z).prerotate(rot), colorspace=pymupdf.csGRAY, alpha=False)
+    w, h, s, st = pix.width, pix.height, pix.samples, pix.stride
+    pts = [(x, y) for y in range(h) for x in range(w) if s[y * st + x] < 160]
+    if len(pts) < 500:
+        return 0.0
+    if len(pts) > 60000:
+        pts = pts[:: len(pts) // 60000 + 1]
+
+    def score(deg):
+        t = math.tan(math.radians(deg))
+        hist = {}
+        for x, y in pts:
+            k = int(y - x * t)
+            hist[k] = hist.get(k, 0) + 1
+        return sum(v * v for v in hist.values())
+
+    best = max((score(a / 2), a / 2) for a in range(-6, 7))[1]                 # coarse: 0.5° steps
+    best = max((score(best + a / 20), best + a / 20) for a in range(-10, 11))[1]  # fine: 0.05° steps
+    return best
+
+
+def straightened(page, rot, skew, longest=3000):
+    """Render the page upright and de-tilted, and return it as a one-page document to read from."""
+    z = longest / max(page.rect.width, page.rect.height)
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z).prerotate(rot - skew), alpha=False)
+    img = pymupdf.open("png", pix.tobytes("png"))
+    return pymupdf.open("pdf", img.convert_to_pdf())[0]
+
+
+# Column rules of the printed Register Dakhil Kharij, left to right, as fractions of the table width
+# (measured on a clean page). Only used to choose the right 18 when a scan shows extra rules.
+FORM_RULES = [0.0, 0.058, 0.1235, 0.1927, 0.2411, 0.2916, 0.3491, 0.4635, 0.5051, 0.5567,
+              0.6094, 0.6631, 0.71, 0.7616, 0.818, 0.9266, 0.9611, 1.0]
+
+
+def pick_columns(xs):
+    """From candidate vertical rules, return the 18 that form the 17 columns, or None."""
+    if len(xs) == 18:
+        return xs
+    if not 18 < len(xs) <= 22:
+        return None
+    best, best_err = None, 0.04  # worst allowed deviation from the form layout, in table widths
+    for drop in itertools.combinations(range(len(xs)), len(xs) - 18):
+        cand = [x for i, x in enumerate(xs) if i not in drop]
+        span = cand[-1] - cand[0]
+        if span <= 0:
+            continue
+        err = max(abs((x - cand[0]) / span - t) for x, t in zip(cand, FORM_RULES))
+        if err < best_err:
+            best, best_err = cand, err
+    return best
+
+
 def find_grid(page, rot=0):
     """Locate the register table on an (upright after `rot`) page.
     Returns {"cols": [(x0, x1) for column 1..17], "rows": [(y0, y1) data bands], "top": y, "size": (w, h)}
@@ -110,12 +161,23 @@ def find_grid(page, rot=0):
     pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z).prerotate(rot), colorspace=pymupdf.csGRAY, alpha=False)
     w, h, D = _dark_rows(pix)
 
-    # Horizontal rules: rows that are mostly dark (OR-ing 3 rows tolerates slight skew and thin lines).
+    # Horizontal rules: rows that are largely dark. OR-ing a few rows tolerates slight skew; the bar is
+    # deliberately low because scanned borders are often faint or broken (a real scan's top border
+    # covered only ~45% of the row).
     counts = []
-    for y in range(h - 2):
-        a, b, c = D[y], D[y + 1], D[y + 2]
-        counts.append(sum(1 for i in range(w) if a[i] or b[i] or c[i]))
-    lines = _group([y for y, n in enumerate(counts) if n > 0.5 * w])
+    for y in range(h - 4):
+        rows5 = D[y:y + 5]
+        counts.append(sum(1 for i in range(w) if any(r[i] for r in rows5)))
+    # Rules are thin: a dense row of text can also cover much of the width, but over many more rows.
+    runs, cur = [], []
+    for y, n in enumerate(counts):
+        if n > 0.45 * w and (not cur or y - cur[-1] <= 2):
+            cur.append(y)
+        elif n > 0.45 * w:
+            runs.append(cur); cur = [y]
+    if cur:
+        runs.append(cur)
+    lines = [(r[0] + r[-1]) // 2 + 2 for r in runs if len(r) <= 14]
     if len(lines) < 3:
         return None
 
@@ -124,18 +186,29 @@ def find_grid(page, rot=0):
         if y1 - y0 < 6:
             return []
         need = frac * (y1 - y0)
-        xs = [x for x in range(w - 1) if sum(1 for y in range(y0, y1) if D[y][x] or D[y][x + 1]) >= need]
-        return _group(xs)
+        edge = int(0.01 * w)  # the scanned paper's own edge often shows up as a dark "rule"
+        xs = [x for x in range(edge, w - 2 - edge)
+              if sum(1 for y in range(y0, y1) if D[y][x] or D[y][x + 1] or D[y][x + 2]) >= need]
+        return _group(xs, gap=8)  # thick or doubled rules count once
 
-    bands = [(a, b, verticals(a, b)) for a, b in zip(lines, lines[1:])]
-    # The column-number row: the first band crossed by 18 rules (17 columns). It's short, so be lenient.
-    num = next((i for i, (a, b, v) in enumerate(bands) if 16 <= len(v) <= 20), None)
+    bands = [(a, b, verticals(a, b, 0.8)) for a, b in zip(lines, lines[1:])]
+    # The column-number row (١ … ١٧): the first SHORT band crossed by 18 rules (17 columns). Short bands
+    # are sensitive to how strictly a rule must span them, so try several strictness levels; extra
+    # rules (a frame, the next page peeking in) are weeded out by matching the form's column layout.
+    num = v = None
+    for i, (a, b, _) in enumerate(bands):
+        if b - a > 0.06 * h:
+            continue
+        for frac in (0.9, 0.8, 0.7, 0.6, 0.5):
+            v = pick_columns(verticals(a, b, frac))
+            if v:
+                break
+        if v:
+            num = i
+            break
     if num is None:
         return None
-    v = bands[num][2]
-    if len(v) != 18:  # a rule was missed or doubled: keep the 18 that best match the outer borders
-        return None
-    cols = [(v[17 - k] / w, v[18 - k] / w) for k in range(1, 18)]  # column 1 is rightmost
+    cols =[(v[17 - k] / w, v[18 - k] / w) for k in range(1, 18)]  # column 1 is rightmost
 
     # Header: after the number row comes a row of merged group headings (few rules) and then the
     # column titles. Data rows are the ruled bands after that which still carry most column rules.
@@ -143,11 +216,93 @@ def find_grid(page, rot=0):
     if i < len(bands) and len(bands[i][2]) < 12:
         i += 1          # group-heading row
     i += 1              # column-title row
-    rows = [(a / h, b / h) for a, b, vv in bands[i:] if len(vv) >= 12 and (b - a) > 0.02 * h]
+    # Everything below the titles, down to the table's bottom rule, is entry rows (their rules may be
+    # faint on continuation pages, so don't insist on seeing every column rule).
+    rows = [(a / h, b / h) for a, b, vv in bands[i:] if (b - a) > 0.02 * h]
     return {"cols": cols, "rows": rows, "top": bands[num][0] / h, "size": (w, h)}
 
 
-def read_page(page, rot, ask, reader_model, khata_model, lock=None):
+def _gray(png):
+    pix = pymupdf.Pixmap(png)
+    if pix.n > 1:
+        pix = pymupdf.Pixmap(pymupdf.csGRAY, pix)
+    return pix.width, pix.height, pix.samples, pix.stride
+
+
+def khata_layout(page, rot, rect, min_gap=3):
+    """The printed lines of a column-2 cell, top to bottom, as (kind, sub_rect): kind is "num" for a
+    clearly number-shaped line (3+ digits are 2-3x wider than tall, even the small ones under a
+    fraction bar) or "?" for a squat line, which is either the word تا or a short number — the caller
+    asks the model which. Fraction bars, specks and slivers of ruled lines are dropped."""
+    x0, y0, x1, y1 = rect
+    dx = (x1 - x0) * 0.08  # stay clear of the column rules
+    inner = (x0 + dx, y0, x1 - dx, y1)
+    w, h, s, st = _gray(cell_png(page, rot, inner, longest=700))
+    dark = lambda x, y: s[y * st + x] < 150
+
+    def longest_run(y):
+        best = cur = 0
+        for x in range(w):
+            cur = cur + 1 if dark(x, y) else 0
+            best = max(best, cur)
+        return best
+
+    # A fraction bar is a long solid stroke; digits never are. Treat bar rows as blank so a number
+    # pressed right under its bar still counts as its own line.
+    bar_rows = {y for y in range(h) if longest_run(y) >= 0.22 * w}
+    ink = [0 if y in bar_rows else sum(1 for x in range(w) if dark(x, y)) for y in range(h)]
+    bands, start, gap = [], None, 0
+    for y, n in enumerate(ink + [0] * (min_gap + 1)):
+        if n > 0:
+            start = y if start is None else start
+            gap = 0
+        elif start is not None:
+            gap += 1
+            if gap > min_gap:
+                bands.append((start, y - gap))
+                start = None
+    out = []
+    for a, b in bands:
+        xs = [x for x in range(w) if any(dark(x, y) for y in range(a, b + 1) if y not in bar_rows)]
+        if not xs:
+            continue
+        height, width = b - a + 1, xs[-1] - xs[0] + 1
+        if width >= 6 * height or (height <= 3 and width <= 4) or width < 0.4 * height or width <= 3:
+            continue  # fraction bar, speck, or a sliver of a ruled line
+        pad = max(2, height // 4)
+        sub = (xs[0] - pad, max(0, a - pad), xs[-1] + pad, min(h, b + pad))
+        sub = (inner[0] + (inner[2] - inner[0]) * sub[0] / w, y0 + (y1 - y0) * sub[1] / h,
+               inner[0] + (inner[2] - inner[0]) * sub[2] / w, y0 + (y1 - y0) * sub[3] / h)
+        out.append(("num" if width >= 1.9 * height else "?", sub))
+    return out
+
+
+def build_khata(numbers, layout):
+    """Put the digits read from the whole cell onto the line layout: a "to" line between two numbers
+    makes a range. Returns (items, ok) — ok is False when the counts don't line up."""
+    kinds = [k for k, *_ in layout]
+    slots = kinds.count("num")
+    numbers = list(numbers)
+    while len(numbers) > slots and any(n < 10 for n in numbers):
+        # the model sometimes reads تا as a single digit ("5"): drop such strays, keeping the order
+        numbers.remove(next(n for n in numbers if n < 10))
+    if len(numbers) != slots:
+        return [(n, None) for n in numbers], False
+    items, it, pending = [], iter(numbers), False
+    for k in kinds:
+        if k == "to":
+            pending = bool(items) and items[-1][1] is None
+        elif pending:
+            items[-1], pending = (items[-1][0], next(it)), False
+        else:
+            items.append((next(it), None))
+    return items, True
+
+
+def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="katat"):
+    """plot_field: "katat" = the small number under the column 17 total (some registers);
+    "khasra" = the number(s) under the bars in column 16 (registers that list khasra numbers instead).
+    The value is returned in the record's "katat" key either way, with the flag "katat"."""
     """Read every mutation entry on one register page.
     `ask(model, prompt, png) -> str` calls the local vision model. `lock` (optional) is held while
     rendering — MuPDF isn't thread-safe — but not during the slow model calls. Returns a dict:
@@ -155,11 +310,16 @@ def read_page(page, rot, ask, reader_model, khata_model, lock=None):
      confidence, notes, cells}], "grid": {...}} — cells/grid (fractions) let the UI outline what was read."""
     lock = lock or contextlib.nullcontext()
     with lock:
+        skew = estimate_skew(page, rot)
+        if abs(skew) >= 0.1:  # tilted scan: read from an upright, de-tilted copy
+            page, rot = straightened(page, rot, skew, longest=3600), 0
         grid = find_grid(page, rot)
     if not grid:
         return {"ok": False, "records": [], "error": "Couldn't find the 17-column register table on this page. "
                 "If it is sideways, rotate it upright first; if it isn't a Register Dakhil Kharij page, type the entry in by hand."}
     cols = grid["cols"]
+    with lock:
+        location = header_box(page, rot, grid)
     records = []
     for y0, y1 in grid["rows"]:
         def rect(col, top=0.0, bottom=1.0):
@@ -167,14 +327,15 @@ def read_page(page, rot, ask, reader_model, khata_model, lock=None):
             pad = (x1 - x0) * 0.04
             return (x0 + pad, y0 + (y1 - y0) * top + 0.003, x1 - pad, y0 + (y1 - y0) * bottom - 0.003)
 
-        # Column 2 also holds an owner ID / share fraction lower down in some layouts; the khata stack
-        # sits in the upper part of the cell, so read the top 60%.
-        cells = {1: rect(1, 0, 0.5), 2: rect(2, 0, 0.6), 14: rect(14, 0, 0.5), 17: rect(17, 0, 0.5)}
+        # The khata stack can run most of the way down column 2; the other values sit near the top.
+        cells = {1: rect(1, 0, 0.5), 2: rect(2, 0, 1.0), 14: rect(14, 0, 0.5), 17: rect(17, 0, 0.5)}
+        if plot_field == "khasra":
+            cells[16] = rect(16, 0, 1.0)  # a list of khasra entries can run down the cell
         with lock:
             inked = {c: cell_ink(page, rot, r) >= INK_MIN for c, r in cells.items()}
             png = {c: cell_png(page, rot, r) for c, r in cells.items() if inked[c]}
-        if not any(inked.values()):
-            continue  # empty ruled row
+        if not (inked[1] or inked[2]):
+            continue  # every entry has an award number / khata; anything else is an empty or stray row
         notes, flags, conf = [], [], "high"
 
         award = parse_award(ask(reader_model, PROMPT_PLAIN, png[1])) if inked[1] else ""
@@ -183,20 +344,21 @@ def read_page(page, rot, ask, reader_model, khata_model, lock=None):
 
         khata = ""
         if inked[2]:
-            items = parse_khata(ask(khata_model, PROMPT_KHATA, png[2]))
-            check = _plain_numbers(ask(reader_model, PROMPT_PLAIN, png[2]))
-            pool, missing = list(check), []
-            for n in (n for a, b in items for n in (a, b) if n is not None):
-                if n in pool:
-                    pool.remove(n)
-                else:
-                    missing.append(n)
-            if missing or not items:
-                # The two readings disagree: keep the digits both models saw, flag the row.
+            # Digits from one whole-cell reading (accurate); where the ranges are from the line layout.
+            numbers = _plain_numbers(ask(reader_model, PROMPT_PLAIN, png[2]))
+            with lock:
+                layout = khata_layout(page, rot, cells[2])
+                unsure = {i: cell_png(page, rot, r, longest=200) for i, (k, r) in enumerate(layout) if k == "?"}
+            for i, img in unsure.items():
+                # Squat line: the word تا, or a short number? TranslateGemma transcribes a short number
+                # and returns nothing for تا; qwen tends to invent digits for تا, so it isn't used here.
+                digits = re.search(r"\d", _norm(ask(urdu_model, PROMPT_PLAIN, img)))
+                layout[i] = ("num" if digits else "to", layout[i][1])
+            items, ok = build_khata(numbers, layout)
+            if not ok or not items:
                 conf = "medium"; flags.append("khata")
-                notes.append(f"khata numbers uncertain (read {format_khata(items) or '-'}; check read {', '.join(map(str, check)) or '-'})")
-                if not items:
-                    items = [(n, None) for n in check]
+                notes.append(f"khata: read {len(numbers)} number(s) but the cell shows "
+                             f"{sum(k == 'num' for k, *_ in layout)} line(s) of numbers — check the list and any 'to' ranges")
             khata = format_khata(items)
 
         kanal = marla = sarsai = katat = ""
@@ -206,54 +368,47 @@ def read_page(page, rot, ask, reader_model, khata_model, lock=None):
                 kanal, marla, sarsai = kms
             else:
                 notes.append("column 14 area could not be read"); flags.append("area"); conf = "low"
-        if inked[17]:
+        if plot_field == "khasra":
+            if inked[16] and (inked[14] or inked[17]):  # continuation pages leave the new-entry half blank
+                katat = parse_khasra(ask(reader_model, PROMPT_PLAIN, png[16]))
+                if not katat:
+                    notes.append("khasra number in column 16 could not be read"); flags.append("katat"); conf = "low"
+        elif inked[17]:
             total, katat = parse_total_katat(ask(reader_model, PROMPT_PLAIN, png[17]))
             if not katat:
                 notes.append("katat under the column 17 total could not be read"); flags.append("katat"); conf = "low"
-        continuation = (inked[1] or inked[2]) and not inked[14] and not inked[17]
+        continuation = not inked[14] and not inked[17]
+        if continuation and not khata:
+            continue  # a page that only lists more owners for the same award: nothing to tabulate
         records.append({"award": award, "khata": khata, "katat": katat, "kanal": kanal, "marla": marla,
                         "sarsai": sarsai, "continuation": continuation, "confidence": conf, "notes": "; ".join(notes),
                         "flags": flags,
-                        "cells": {str(c): r for c, r in cells.items()}})
-    return {"ok": True, "records": records, "error": "", "grid": grid}
+                        # the cells actually read (column 17 is only checked for ink in khasra mode)
+                        "cells": {str(c): r for c, r in cells.items() if not (c == 17 and plot_field == "khasra")}})
+    return {"ok": True, "records": records, "error": "", "grid": grid, "skew": round(skew, 2), "location": location}
 
 
-def header_segments(page, rot, table_top, min_gap=0.02):
-    """The line of text just above the table holds 'محال …  حدبست نمبر …  تحصیل …  ضلع …  سال …'.
-    Split it into phrases at wide blank gaps. Returns [(x0, x1, png)] in fractions, right to left."""
+def header_box(page, rot, grid):
+    """Box around the line just above the table that names the place — 'محال …  حدبست نمبر …
+    تحصیل …  ضلع …'. The names aren't read (the local models can't read this handwriting reliably);
+    the box lets the user check the batch District/Tehsil/Mouza against the page at a glance."""
     z = RENDER_LONG / max(page.rect.width, page.rect.height)
     pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z).prerotate(rot), colorspace=pymupdf.csGRAY, alpha=False)
     w, h, D = _dark_rows(pix)
-    y1 = int(table_top * h) - 3
-    # Walk up from the table border to find the text line: the first run of inked rows.
-    inked = [y for y in range(max(0, y1 - int(0.12 * h)), y1) if sum(D[y]) > 0.002 * w]
-    if not inked:
-        return []
-    bottom = inked[-1]
-    line_rows = [bottom]
-    for y in range(bottom - 1, max(0, bottom - int(0.08 * h)), -1):
-        if sum(D[y]) > 0.002 * w:
-            line_rows.append(y)
-        elif bottom - y > 0.012 * h and sum(D[y]) == 0:
-            break
-    ya, yb = min(line_rows) - 4, bottom + 4
-    cols = [any(D[y][x] for y in range(ya, yb)) for x in range(w)]
-    segs, start, gap = [], None, 0
-    for x, ink in enumerate(cols + [False] * int(min_gap * w + 2)):
-        if ink:
-            if start is None:
-                start = x
-            gap = 0
-        elif start is not None:
-            gap += 1
-            if gap > min_gap * w:
-                segs.append((start, x - gap))
-                start = None
-    out = []
-    for a, b in reversed(segs):  # Urdu reads right to left
-        rect = ((a - 6) / w, ya / h, (b + 6) / w, yb / h)
-        out.append((rect[0], rect[2], cell_png(page, rot, rect, longest=700)))
-    return out
+    xa, xb = int(grid["cols"][16][0] * w), int(grid["cols"][0][1] * w)  # the table's left and right edges
+    top = int(grid["top"] * h) - 4
+    inked = lambda y: sum(D[y][xa:xb]) > 0.003 * (xb - xa)
+    # Walk up from the table's top border to the nearest line of text, then to its top.
+    y = top
+    while y > top - 0.08 * h and not inked(y):
+        y -= 1
+    if not inked(y):
+        return None
+    bottom = y
+    while y > max(0, bottom - 0.06 * h) and (inked(y) or inked(y - 1) or inked(y - 2)):
+        y -= 1
+    pad = 0.004
+    return (xa / w, max(0.0, y / h - pad), xb / w, min(grid["top"], bottom / h + pad))
 
 
 def _unrotate(rect, rot):
@@ -269,12 +424,39 @@ def cell_ink(page, rot, frac_rect):
     because that is exactly where small models invent text."""
     x0, y0, x1, y1 = frac_rect
     dx, dy = (x1 - x0) * 0.06, (y1 - y0) * 0.02
-    png = cell_png(page, rot, (x0 + dx, y0 + dy, x1 - dx, y1 - dy), longest=300)
-    pix = pymupdf.Pixmap(png)
-    if pix.n > 1:
-        pix = pymupdf.Pixmap(pymupdf.csGRAY, pix)
-    s = pix.samples
-    return sum(1 for v in s if v < 140) / max(1, len(s))
+    w, h, s, st = _gray(cell_png(page, rot, (x0 + dx, y0 + dy, x1 - dx, y1 - dy), longest=300))
+    dark = [[s[y * st + x] < 140 for x in range(w)] for y in range(h)]
+    # Ignore ruled lines that stray into the crop (a border that's still slightly sloped after
+    # straightening): pixels in long straight runs are rules, not writing.
+    rule = [[False] * w for _ in range(h)]
+    for y in range(h):
+        x = 0
+        while x < w:
+            if dark[y][x]:
+                e = x
+                while e < w and dark[y][e]:
+                    e += 1
+                if e - x >= 0.25 * w:
+                    for i in range(x, e):
+                        rule[y][i] = True
+                x = e
+            else:
+                x += 1
+    for x in range(w):
+        y = 0
+        while y < h:
+            if dark[y][x]:
+                e = y
+                while e < h and dark[e][x]:
+                    e += 1
+                if e - y >= 0.25 * h:
+                    for i in range(y, e):
+                        rule[i][x] = True
+                y = e
+            else:
+                y += 1
+    n = sum(1 for y in range(h) for x in range(w) if dark[y][x] and not rule[y][x])
+    return n / max(1, w * h)
 
 
 def cell_png(page, rot, frac_rect, longest=900):
