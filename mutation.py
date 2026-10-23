@@ -378,8 +378,10 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
             if not katat:
                 notes.append("katat under the column 17 total could not be read"); flags.append("katat"); conf = "low"
         continuation = not inked[14] and not inked[17]
-        if continuation and not khata:
-            continue  # a page that only lists more owners for the same award: nothing to tabulate
+        if not khata and not (kanal or marla or sarsai):
+            # Only more owners for the award, or a summary page (totals, share-transferred box) with no
+            # khata and no column-14 area: nothing to put in the table's columns.
+            continue
         records.append({"award": award, "khata": khata, "katat": katat, "kanal": kanal, "marla": marla,
                         "sarsai": sarsai, "continuation": continuation, "confidence": conf, "notes": "; ".join(notes),
                         "flags": flags,

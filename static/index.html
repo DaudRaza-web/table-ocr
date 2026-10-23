@@ -45,6 +45,7 @@
   .sheet td.warn { background: color-mix(in srgb, #f5a623 22%, transparent); box-shadow: inset 0 0 0 1px #e0901a; }
   .sheet td.cont { background: color-mix(in srgb, var(--accent) 8%, transparent); }
   .issues { margin: 10px 0 0; padding-left: 18px; font-size: 13px; color: #b06a00; }
+  #mIssues { max-height: calc(5 * 1.45em + 4px); line-height: 1.45; overflow-y: auto; padding-right: 6px; }  /* scrolls after 5 messages */
   @media (prefers-color-scheme: dark) { .issues { color: #f0b000; } }
   h3.sub { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 18px 0 8px; }
   table.totals { border-collapse: collapse; font-size: 13px; }
@@ -250,7 +251,7 @@ const $ = s => document.querySelector(s);
 const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, busy: false, tab: 'table', rot: {}, shownRot: 0 };
 let grid = null;  // table editor (grid.js); holds the table data
 let mGrid = null; // mutation register table (fixed headers)
-const M = { flags: new Map(), notes: [], cells: {}, running: false, halt: false };  // flags: "award|khata" -> {col: note}
+const M = { flags: new Map(), notes: [], emptyPages: new Set(), cells: {}, running: false, halt: false };  // flags: "award|khata" -> {col: note}
 
 function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
 function busy(on) { state.busy = on; $('#spinner').style.display = on ? 'inline-block' : 'none'; refreshButtons(); }
@@ -499,13 +500,16 @@ $('#saveOut').onclick = () => {
 // Same job as the cloud "Mutation Register Extractor": read each register page, fill a fixed-header
 // table, flag what needs checking, total the land per award, export to Excel. Reading is done by the
 // server with the local models (see mutation.py).
-const M_HEAD = ['S.No.', 'Award /mutation No', 'District', 'Tehsil', 'Mouza', 'Khata Khatuni', 'Katat', 'Kanal', 'Marla', 'Sq ft OR Sarsai'];
+// The 10 fixed headers, plus the source page (for tracking and revision) at the end.
+const M_HEAD = ['S.No.', 'Award /mutation No', 'District', 'Tehsil', 'Mouza', 'Khata Khatuni', 'Katat', 'Kanal', 'Marla', 'Sq ft OR Sarsai', 'Page'];
+const PAGE_COL = 10;
 const isInt = v => /^\d+$/.test(String(v ?? '').trim()), isNum = v => /^\d+(\.\d+)?$/.test(String(v ?? '').trim());
 const normLoc = v => String(v ?? '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 const batch = () => ({ district: $('#mDistrict').value.trim(), tehsil: $('#mTehsil').value.trim(), mouza: $('#mMouza').value.trim() });
 const plotField = () => $('#mPlot').value;  // 'katat' or 'khasra': what column 7 of the table holds
 const unitInfo = () => $('#mUnit').value === 'sqft' ? { label: 'Sq ft', per: 272 } : { label: 'Sarsai', per: 9 };
-const mKey = row => `${String(row[1]).trim()}|${String(row[5]).trim()}`;
+const mKey = row => `${String(row[PAGE_COL] ?? '').trim()}|${String(row[1]).trim()}|${String(row[5]).trim()}`;
+const pageOf = row => String(row[PAGE_COL] ?? '').trim();
 const isContinuation = row => (String(row[1]).trim() || String(row[5]).trim()) && [6, 7, 8, 9].every(c => !String(row[c]).trim());
 
 function rowIssues(row) {  // -> [[col or null, text]]
@@ -560,14 +564,18 @@ let mClearArmed = false;
 $('#mClear').onclick = e => {
   if (!mClearArmed) { mClearArmed = true; e.target.textContent = 'Click again to clear'; setTimeout(() => { mClearArmed = false; e.target.textContent = 'Clear all'; }, 3000); return; }
   mClearArmed = false; e.target.textContent = 'Clear all';
-  mGrid.clear(); M.flags.clear(); M.notes = []; M.cells = {}; drawCellBoxes(); mChanged(); status('Cleared (Ctrl+Z in the table brings the rows back).');
+  mGrid.clear(); M.flags.clear(); M.notes = []; M.emptyPages.clear(); M.cells = {}; drawCellBoxes(); mChanged(); status('Cleared (Ctrl+Z in the table brings the rows back).');
 };
 
 function mRenderIssues() {
   const ul = $('#mIssues'); ul.innerHTML = '';
   const add = text => { const li = document.createElement('li'); li.textContent = text; ul.append(li); };
-  M.notes.forEach(add);
-  mGrid.rows.forEach((row, i) => rowIssues(row).forEach(([, t]) => add(`S.No. ${i + 1}: ${t}`)));
+  mNotes().forEach(add);
+  mGrid.rows.forEach((row, i) => rowIssues(row).forEach(([, t]) => add(`S.No. ${i + 1}${pageOf(row) ? ` (page ${pageOf(row)})` : ''}: ${t}`)));
+}
+function mNotes() {  // per-page notes, plus one combined line for pages with nothing to add
+  const empty = [...M.emptyPages].sort((a, b) => a - b);
+  return empty.length ? [...M.notes, `Nothing to add on page${empty.length === 1 ? '' : 's'} ${empty.join(', ')} (pages that only list more owners for the award, or blank pages).`] : M.notes;
 }
 function mTotals() {
   const per = unitInfo().per, groups = new Map();
@@ -649,30 +657,31 @@ async function mRead(pages) {
     try { j = await api('/api/mutation/read', { method: 'POST', body: JSON.stringify({ id: state.doc, page: n, rot: rotOf(n), model, plot: plotField() }) }); }
     catch (e) { M.notes.push(`Page ${n + 1}: ${e.message}`); failed++; continue; }
     M.notes = M.notes.filter(t => !t.startsWith(`Page ${n + 1}:`));
+    M.emptyPages.delete(n + 1);
     if (!j.ok) { M.notes.push(`Page ${n + 1}: ${j.error}`); failed++; mRenderIssues(); continue; }
-    if (!j.records.length) M.notes.push(`Page ${n + 1}: no mutation entry found (blank, cover or index page?).`);
+    if (!j.records.length) M.emptyPages.add(n + 1);
     M.cells[n] = { rot: rotOf(n), boxes: j.records.flatMap(rec => Object.entries(rec.cells).map(([col, r]) => ({ col: +col, r }))) };
     if (j.location && j.records.length) M.cells[n].boxes.push({ col: 'loc', r: j.location });
     drawCellBoxes();
     const rows = [];
     let table = mGrid.rows.map(r => [...r]), filled = 0;
-    for (const rec of j.records) {
-      const row = ['', rec.award, b.district, b.tehsil, b.mouza, rec.khata, rec.katat, rec.kanal, rec.marla, rec.sarsai];
+    // Rows already taken from this page (it is being read again, e.g. after switching Katat/Khasra):
+    // the n-th entry on the page updates the n-th such row instead of adding a duplicate.
+    const earlier = table.filter(r => pageOf(r) === String(n + 1));
+    j.records.forEach((rec, i) => {
+      const row = ['', rec.award, b.district, b.tehsil, b.mouza, rec.khata, rec.katat, rec.kanal, rec.marla, rec.sarsai, String(n + 1)];
       const cols = { award: [1], khata: [5], katat: [6], area: [7, 8, 9] }, f = {};
       (rec.flags || []).forEach(k => (cols[k] || []).forEach(c => { f[c] = rec.notes; }));
-      if (Object.keys(f).length) M.flags.set(mKey(row), f); else M.flags.delete(mKey(row));  // latest read wins
-      const same = table.find(r => mKey(r) === mKey(row));
+      const same = earlier[i];
       if (same) {
-        // Already in the table (page read again, e.g. after switching Katat/Khasra): fill only the cells
-        // that are still empty, so nothing typed or corrected by hand is overwritten.
-        let n2 = 0;
-        row.forEach((v, c) => { if (c > 0 && String(v ?? '').trim() && !String(same[c] ?? '').trim()) { same[c] = v; n2++; } });
-        filled += n2;
-        if (!n2) M.notes.push(`Page ${n + 1}: award ${rec.award} (khata ${rec.khata}) is already in the table — nothing new to fill in.`);
-        continue;
+        // Fill only the cells that are still empty, so nothing typed or corrected by hand is overwritten.
+        row.forEach((v, c) => { if (c > 0 && String(v ?? '').trim() && !String(same[c] ?? '').trim()) { same[c] = v; filled++; } });
+        if (Object.keys(f).length) M.flags.set(mKey(same), f); else M.flags.delete(mKey(same));  // latest read wins
+        return;
       }
+      if (Object.keys(f).length) M.flags.set(mKey(row), f);
       rows.push(row);
-    }
+    });
     if (filled) { mGrid.setData(table); filledAll += filled; }  // one undoable step
     if (rows.length) { mGrid.appendRows(rows); added += rows.length; }
     mChanged();
@@ -686,8 +695,8 @@ $('#mReadAll').onclick = () => mRead([...Array(state.pages).keys()]);
 $('#mStop').onclick = () => { M.halt = true; status('Stopping after the current page…'); };
 
 function mIssueList() {
-  const out = M.notes.map(t => ['', t]);
-  mGrid.rows.forEach((row, i) => rowIssues(row).forEach(([, t]) => out.push([i + 1, t])));
+  const out = mNotes().map(t => ['', t]);
+  mGrid.rows.forEach((row, i) => rowIssues(row).forEach(([, t]) => out.push([i + 1, (pageOf(row) ? `Page ${pageOf(row)}: ` : '') + t])));
   return out;
 }
 $('#mExport').onclick = async () => {

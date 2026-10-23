@@ -5,6 +5,7 @@ vision model running in the local Ollama (WSL), then exports the edited table
 to .xlsx. Everything runs on this machine; nothing leaves localhost.
 """
 import base64
+import http.client
 import io
 import json
 import os
@@ -404,7 +405,7 @@ def to_cell_value(s):
 
 
 MUTATION_HEADERS = ["S.No.", "Award /mutation No", "District", "Tehsil", "Mouza", "Khata Khatuni",
-                    "Katat", "Kanal", "Marla", "Sq ft OR Sarsai"]
+                    "Katat", "Kanal", "Marla", "Sq ft OR Sarsai", "Page"]  # Page = source page, for revision
 MARLA_PER_KANAL = 20
 THIRD_PER_MARLA = {"sarsai": 9, "sqft": 272}
 
@@ -423,15 +424,15 @@ def build_mutation_xlsx(rows, unit, issues, plot="katat"):
     for c in ws[1]:
         c.font, c.fill = head_font, fill
     for i, row in enumerate(rows, start=1):
-        vals = [i] + [str(v).strip() for v in row[1:10]]
-        for j in (1, 6, 7, 8, 9):  # numeric columns
+        vals = [i] + [str(v).strip() for v in (list(row[1:11]) + [""] * 10)[:10]]
+        for j in (1, 6, 7, 8, 9, 10):  # numeric columns
             v = vals[j]
             if re.fullmatch(r"\d+", v):
                 vals[j] = int(v)
             elif re.fullmatch(r"\d+\.\d+", v):
                 vals[j] = float(v)
         ws.append(vals)
-    for col, w in zip("ABCDEFGHIJ", (7, 20, 12, 14, 16, 28, 8, 8, 8, 16)):
+    for col, w in zip("ABCDEFGHIJK", (7, 20, 12, 14, 16, 28, 10, 8, 8, 16, 7)):
         ws.column_dimensions[col].width = w
     ws.freeze_panes = "A2"
 
@@ -664,12 +665,16 @@ class Handler(BaseHTTPRequestHandler):
                 reader = req.get("model") or DEFAULT_MODEL
 
                 def ask(model, prompt, png):  # one small cell per call
-                    res = ollama_request("/api/chat", {
-                        "model": model, "stream": False, "keep_alive": "15m",
-                        "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 200},
-                        "messages": [{"role": "user", "content": prompt, "images": [base64.b64encode(png).decode()]}],
-                    }, timeout=600)
-                    return res.get("message", {}).get("content", "")
+                    body = {"model": model, "stream": False, "keep_alive": "15m",
+                            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 200},
+                            "messages": [{"role": "user", "content": prompt, "images": [base64.b64encode(png).decode()]}]}
+                    for attempt in range(3):  # Ollama occasionally drops a connection (e.g. while swapping models)
+                        try:
+                            return ollama_request("/api/chat", body, timeout=600).get("message", {}).get("content", "")
+                        except (OSError, http.client.HTTPException):
+                            if attempt == 2:
+                                raise
+                            time.sleep(3 * (attempt + 1))
 
                 t0 = time.time()
                 out = mutation.read_page(doc[int(req["page"])], norm_rot(req.get("rot")), ask, reader,
