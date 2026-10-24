@@ -251,7 +251,7 @@ const $ = s => document.querySelector(s);
 const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, busy: false, tab: 'table', rot: {}, shownRot: 0 };
 let grid = null;  // table editor (grid.js); holds the table data
 let mGrid = null; // mutation register table (fixed headers)
-const M = { flags: new Map(), notes: [], emptyPages: new Set(), khataTotals: new Map(), cells: {}, running: false, halt: false, sinceCheck: 0 };  // flags: "award|khata" -> {col: note}
+const M = { flags: new Map(), notes: [], emptyPages: new Set(), khataTotals: new Map(), alts: new Map(), cells: {}, running: false, halt: false, sinceCheck: 0 };  // flags: "award|khata" -> {col: note}
 
 function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
 function busy(on) { state.busy = on; $('#spinner').style.display = on ? 'inline-block' : 'none'; refreshButtons(); }
@@ -309,7 +309,7 @@ async function openFile(f) {
     // the models from memory so they load fresh for this document.
     const hadRows = mGrid.hasData();
     if (hadRows) mGrid.clear();
-    M.flags.clear(); M.notes = []; M.emptyPages.clear(); M.khataTotals.clear(); M.cells = {}; M.sinceCheck = 0;
+    M.flags.clear(); M.notes = []; M.emptyPages.clear(); M.khataTotals.clear(); M.alts.clear(); M.cells = {}; M.sinceCheck = 0;
     mChanged();
     api('/api/models/unload', { method: 'POST', body: JSON.stringify({ models: [$('#model').value, $('#tModel').value].filter(Boolean) }) }).catch(() => {});
     $('#fname').textContent = f.name;
@@ -539,6 +539,40 @@ function khataMismatches() {
   }
   return out;
 }
+// Where the two models read a khasra's area differently, try their alternatives on any khata that doesn't
+// add up to its total; if a combination makes it balance exactly, use it (and say so in the messages).
+function mResolveAlts() {
+  if (plotField() !== 'khasra' || !M.alts.size) return;
+  const per = unitInfo().per, units = (k, m, s) => (+k || 0) * 20 * per + (+m || 0) * per + (+s || 0);
+  const altKey = r => `${pageOf(r)}|${String(r[6]).trim()}|${r[7]}-${r[8]}-${r[9]}`;
+  const rows = mGrid.rows.map(r => [...r]), groups = new Map();
+  rows.forEach((r, i) => {
+    const key = `${String(r[1]).trim()}|${String(r[5]).trim()}`;
+    if (M.khataTotals.has(key)) groups.set(key, [...(groups.get(key) || []), i]);
+  });
+  const fixes = [];
+  for (const [key, idxs] of groups) {
+    const want = units(...M.khataTotals.get(key)), got = idxs.reduce((s, i) => s + units(rows[i][7], rows[i][8], rows[i][9]), 0);
+    if (Math.abs(got - want) < 0.01) continue;
+    const cands = idxs.filter(i => M.alts.has(altKey(rows[i])));
+    if (!cands.length || cands.length > 10) continue;
+    for (let mask = 1; mask < (1 << cands.length); mask++) {
+      let delta = 0;
+      cands.forEach((i, b) => { if (mask & (1 << b)) { const a = M.alts.get(altKey(rows[i])).split('-'); delta += units(...a) - units(rows[i][7], rows[i][8], rows[i][9]); } });
+      if (Math.abs(got + delta - want) < 0.01) {
+        cands.forEach((i, b) => {
+          if (!(mask & (1 << b))) return;
+          const k = altKey(rows[i]), a = M.alts.get(k), was = `${rows[i][7]}-${rows[i][8]}-${rows[i][9]}`;
+          M.alts.delete(k);
+          [rows[i][7], rows[i][8], rows[i][9]] = a.split('-');
+          fixes.push(`Page ${pageOf(rows[i])}, khasra ${rows[i][6]}: area read as ${was} by one model and ${a} by the other — used ${a}, which makes khata ${key.split('|')[1]} add up to its total.`);
+        });
+        break;
+      }
+    }
+  }
+  if (fixes.length) { M.notes.push(...fixes); mGrid.setData(rows); }
+}
 const isKhasraOnly = row => plotField() === 'khasra' && /\d/.test(String(row[6])) && !String(row[5]).trim() && [7, 8, 9].every(c => !String(row[c]).trim());
 const isContinuation = row => (String(row[1]).trim() || String(row[5]).trim()) && [6, 7, 8, 9].every(c => !String(row[c]).trim());
 
@@ -602,7 +636,7 @@ let mClearArmed = false;
 $('#mClear').onclick = e => {
   if (!mClearArmed) { mClearArmed = true; e.target.textContent = 'Click again to clear'; setTimeout(() => { mClearArmed = false; e.target.textContent = 'Clear all'; }, 3000); return; }
   mClearArmed = false; e.target.textContent = 'Clear all';
-  mGrid.clear(); M.flags.clear(); M.notes = []; M.emptyPages.clear(); M.khataTotals.clear(); M.cells = {}; drawCellBoxes(); mChanged(); status('Cleared (Ctrl+Z in the table brings the rows back).');
+  mGrid.clear(); M.flags.clear(); M.notes = []; M.emptyPages.clear(); M.khataTotals.clear(); M.alts.clear(); M.cells = {}; drawCellBoxes(); mChanged(); status('Cleared (Ctrl+Z in the table brings the rows back).');
 };
 
 function mRenderIssues() {
@@ -750,12 +784,16 @@ async function mRead(pages) {
       }
       let khata = rec.khata;
       if (rec.khasra_only) {
-        // A khasra list continued from an earlier page: attach it to that page's khata for this award,
-        // and skip khasras (number + area) that are already in the table.
-        const prev = others.concat(rows).filter(r => String(r[1]).trim() === String(rec.award).trim() && String(r[5]).trim()
-          && (+pageOf(r) || 0) < n + 1).pop();
+        // A khasra list continued from an earlier page: attach it to that page's award and khata (pages
+        // that leave column 1 blank take the latest entry before them), and skip khasras (number + area)
+        // that are already in the table.
+        const award = String(rec.award).trim();
+        const prev = others.concat(rows).filter(r => String(r[5]).trim() && (+pageOf(r) || 0) < n + 1
+          && (!award || String(r[1]).trim() === award))
+          .sort((a, c) => (+pageOf(a) || 0) - (+pageOf(c) || 0)).pop();
         khata = prev ? prev[5] : '';
-        const seen = new Set(others.filter(r => String(r[1]).trim() === String(rec.award).trim()).map(r => `${String(r[6]).trim()}|${r[7]}-${r[8]}-${r[9]}`));
+        base[1] = award || (prev ? prev[1] : '');
+        const seen = new Set(others.filter(r => String(r[1]).trim() === String(base[1]).trim()).map(r => `${String(r[6]).trim()}|${r[7]}-${r[8]}-${r[9]}`));
         const fresh = items.filter(it => !seen.has(`${it.khasra}|${it.area}`));
         if (!fresh.length) continue;
         fresh.forEach(it => push([...base, khata, it.khasra, ...(kms(it.area).length ? kms(it.area) : ['', '', '']), page], rec));
@@ -765,6 +803,10 @@ async function mRead(pages) {
       if (rec.kanal || rec.marla || rec.sarsai) M.khataTotals.set(`${rec.award}|${khata}`, [rec.kanal, rec.marla, rec.sarsai]);
       items.forEach(it => push([...base, khata, it.khasra, ...(kms(it.area).length ? kms(it.area) : ['', '', '']), page], rec));
     }
+    // The two models' readings of an area, where they disagreed (settled below by the khata totals).
+    for (const rec of j.records) for (const it of (rec.khasra_items || [])) {
+      if (it.alt && it.area) M.alts.set(`${page}|${it.khasra}|${it.area}`, it.alt);
+    }
     if (!rows.length && j.records.length) M.emptyPages.add(n + 1);  // only khasras already in the table
     if (replacing) {
       const at = Math.min(firstOld, others.length);
@@ -773,6 +815,7 @@ async function mRead(pages) {
       rows.length = 0;
     }
     if (rows.length) { mGrid.appendRows(rows); added += rows.length; }
+    mResolveAlts();
     mChanged();
     status(`Page ${n + 1}: ${j.records.length} entr${j.records.length === 1 ? 'y' : 'ies'} read in ${j.seconds}s${replacing ? ' — this page\'s earlier rows were replaced (Ctrl+Z in the table brings them back)' : ''}.`);
   }

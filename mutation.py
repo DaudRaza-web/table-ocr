@@ -60,7 +60,8 @@ def parse_khasra(text):
     Return the full khasra numbers in printed order, repeats included (each is a separate entry with
     its own area): '37/24/1, 37/23/2, 47/3/1, 37/23/2'. The under-bar numbers are dropped."""
     t = re.sub(r"[ \t]*/[ \t]*", "/", _norm(text))  # '56 / 7 / 2' -> '56/7/2', without joining lines
-    return ", ".join(re.findall(r"(?<![\d/])\d{1,5}(?:/\d{1,5})+(?![\d/])", t))
+    # Some registers print a khasra with a leading slash ('/69/7'); keep it as printed.
+    return ", ".join(re.findall(r"(?<![\d/])/?\d{1,5}(?:/\d{1,5})+(?![\d/])", t))
 
 
 def kms_units(k, m, s, per):
@@ -74,12 +75,13 @@ def pair_khasra_areas(khasras, areas):
     sum don't line up."""
     fmt = lambda a: "-".join(a)
     total, problem = "", ""
-    if areas and len(areas) == len(khasras) + 1:
-        *areas, last = areas
-        total = fmt(last)
-        # The third figure may be Sarsai (9 to a Marla) or sq ft (272): accept either.
-        if not any(abs(sum(kms_units(*a, per) for a in areas) - kms_units(*last, per)) < 0.01 for per in (9, 272)):
-            problem = f"column 17 areas don't add up to the total printed under them ({total})"
+    # One area more than khasras: the last is a printed total if it is at least the sum of the others
+    # (it can be the khata's grand total over several pages); a missed khasra's own area is normally
+    # smaller. Either way the table's khata sum check has the final word.
+    if areas and len(areas) == len(khasras) + 1 and any(
+            kms_units(*areas[-1], per) + 0.01 >= sum(kms_units(*a, per) for a in areas[:-1]) for per in (9, 272)):
+        total = fmt(areas[-1])
+        areas = areas[:-1]
     elif areas and len(areas) != len(khasras):
         problem = f"column 16 lists {len(khasras)} khasra number(s) but column 17 has {len(areas)} area(s) — check which area goes with which khasra"
     items = [{"khasra": k, "area": fmt(areas[i]) if i < len(areas) else ""} for i, k in enumerate(khasras)]
@@ -352,11 +354,19 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
             x0, x1 = cols[15]
             cells[16] = (x0 + (x1 - x0) * 0.04, y0 + 0.003, x1 + (x1 - x0) * 0.06, y1 - 0.003)
             cells[17] = rect(17, 0, 1.0)  # one area per khasra, line for line, sometimes a total at the end
+        def render(r):
+            # Size by width, not the longest side: the full-height columns are tall and narrow, and
+            # sized by their height their digits would come out too small to read reliably.
+            aspect = ((r[3] - r[1]) * page.rect.height) / max(1e-6, (r[2] - r[0]) * page.rect.width)
+            return cell_png(page, rot, r, longest=int(min(2400, max(900, 360 * aspect))))
+
         with lock:
             inked = {c: cell_ink(page, rot, r) >= INK_MIN for c, r in cells.items()}
-            png = {c: cell_png(page, rot, r) for c, r in cells.items() if inked[c]}
-        if not (inked[1] or inked[2]):
-            continue  # every entry has an award number / khata; anything else is an empty or stray row
+            png = {c: render(r) for c, r in cells.items() if inked[c]}
+        if not (inked[1] or inked[2] or (plot_field == "khasra" and inked.get(16))):
+            # Every entry has an award number / khata. Exception: in khasra mode, a page that only
+            # continues the khasra list (some registers leave columns 1 and 2 blank on such pages).
+            continue
         notes, flags, conf = [], [], "high"
 
         award = parse_award(ask(reader_model, PROMPT_PLAIN, png[1])) if inked[1] else ""
@@ -395,8 +405,23 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
                 katat = parse_khasra(ask(reader_model, PROMPT_PLAIN, png[16]))
                 if not katat:
                     notes.append("khasra number in column 16 could not be read"); flags.append("katat"); conf = "low"
-            areas = KMS.findall(_norm(ask(reader_model, PROMPT_PLAIN, png[17]))) if inked[17] else []
-            khasra_items, col17_total, msg = pair_khasra_areas(katat.split(", ") if katat else [], areas)
+            khasras = katat.split(", ") if katat else []
+            areas, alts = [], {}
+            if inked[17]:
+                # Read the areas with both models: each misreads a digit now and then, in different
+                # places. Disagreements are kept as alternatives; the table settles them with the
+                # khata's total (whichever combination makes the khata add up).
+                a1 = KMS.findall(_norm(ask(reader_model, PROMPT_PLAIN, png[17])))
+                a2 = KMS.findall(_norm(ask(urdu_model, PROMPT_PLAIN, png[17])))
+                fits = lambda a: len(a) in (len(khasras), len(khasras) + 1)
+                areas = a1 if fits(a1) or not fits(a2) else a2
+                other = a2 if areas is a1 else a1
+                if len(other) == len(areas):
+                    alts = {i: "-".join(o) for i, (a, o) in enumerate(zip(areas, other)) if a != o}
+            khasra_items, col17_total, msg = pair_khasra_areas(khasras, areas)
+            for i, item in enumerate(khasra_items):
+                if i in alts:
+                    item["alt"] = alts[i]
             if msg:
                 notes.append(msg); flags.append("khasra_area"); conf = "medium"
         elif inked[17]:
