@@ -56,17 +56,11 @@ def parse_total_katat(text):
 
 
 def parse_khasra(text):
-    """Column 16 lists khasra entries like '47/9/2/1' with the short number printed under its bar
-    ('47'). Return the under-bar numbers, unique and in order ('47', or '47, 48'). If none were read,
-    fall back to the leading part of the full numbers, which carries the same value."""
-    lines = [ln.strip() for ln in _norm(text).splitlines() if ln.strip()]
-    under = [ln for ln in lines if re.fullmatch(r"\d{1,5}", ln)]
-    leading = [m.group(1) for ln in lines if (m := re.match(r"(\d{1,5})\s*/", ln))]
-    if leading:
-        # The under-bar number repeats the full number's leading part; anything else is a stray
-        # (e.g. the tail of a long number that wrapped onto its own line).
-        under = [n for n in under if n in leading] or leading
-    return ", ".join(dict.fromkeys(under))
+    """Column 16 lists khasra numbers like '37/24/1', each with a short number under its bar ('37').
+    Return the full khasra numbers in printed order, repeats included (each is a separate entry with
+    its own area): '37/24/1, 37/23/2, 47/3/1, 37/23/2'. The under-bar numbers are dropped."""
+    t = re.sub(r"[ \t]*/[ \t]*", "/", _norm(text))  # '56 / 7 / 2' -> '56/7/2', without joining lines
+    return ", ".join(re.findall(r"(?<![\d/])\d{1,5}(?:/\d{1,5})+(?![\d/])", t))
 
 
 def _plain_numbers(text):
@@ -301,7 +295,7 @@ def build_khata(numbers, layout):
 
 def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="katat"):
     """plot_field: "katat" = the small number under the column 17 total (some registers);
-    "khasra" = the number(s) under the bars in column 16 (registers that list khasra numbers instead).
+    "khasra" = the khasra numbers listed in column 16 (registers that list khasra numbers instead).
     The value is returned in the record's "katat" key either way, with the flag "katat"."""
     """Read every mutation entry on one register page.
     `ask(model, prompt, png) -> str` calls the local vision model. `lock` (optional) is held while
@@ -330,7 +324,10 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
         # The khata stack can run most of the way down column 2; the other values sit near the top.
         cells = {1: rect(1, 0, 0.5), 2: rect(2, 0, 1.0), 14: rect(14, 0, 0.5), 17: rect(17, 0, 0.5)}
         if plot_field == "khasra":
-            cells[16] = rect(16, 0, 1.0)  # a list of khasra entries can run down the cell
+            # A list of khasra numbers can run down the cell, and long ones touch the right-hand rule,
+            # so take the full height and reach a little past that rule.
+            x0, x1 = cols[15]
+            cells[16] = (x0 + (x1 - x0) * 0.04, y0 + 0.003, x1 + (x1 - x0) * 0.06, y1 - 0.003)
         with lock:
             inked = {c: cell_ink(page, rot, r) >= INK_MIN for c, r in cells.items()}
             png = {c: cell_png(page, rot, r) for c, r in cells.items() if inked[c]}

@@ -24,7 +24,7 @@ Fix any cells, add a title, then download as `.xlsx`. Nothing leaves your machin
 - **Mutation register tab** for Punjab "Register Dakhil Kharij" pages: reads every page of a PDF (or page images)
   into a fixed table — S.No., Award /mutation No, District, Tehsil, Mouza, Khata Khatuni, Katat, Kanal, Marla,
   Sq ft OR Sarsai — with a "Plot column" option for registers that list khasra numbers instead of a katat
-  (Khasra No. is then read from the numbers under the bars in column 16), batch District/Tehsil/Mouza, cells to check highlighted, the cells it read outlined on the
+  (Khasra No. is then the list of khasra numbers in column 16, e.g. "37/24/1, 37/23/2"), batch District/Tehsil/Mouza, cells to check highlighted, the cells it read outlined on the
   page, a land total per award (Kanal/Marla/Sarsai carried up), and an Excel export with a live-formula Totals sheet
   and a Review sheet. The form's ruled grid is located in code (the ١–١٧ column-number row gives every column), and
   only the cells that matter — columns 1, 2, 14 and 17 — are read by the local models, one small cell at a time.

@@ -76,18 +76,34 @@ def ollama_up():
         return False
 
 
+_KEEPALIVE = None
+_ENSURE_LOCK = threading.Lock()
+
+
+def keep_wsl_alive():
+    """WSL shuts the Linux VM down when no Windows process is attached to it, taking Ollama with it
+    mid-read. Hold one attached process open for as long as the tool runs, restarting it if it ended."""
+    global _KEEPALIVE
+    if sys.platform != "win32" or (_KEEPALIVE and _KEEPALIVE.poll() is None):
+        return
+    try:
+        _KEEPALIVE = subprocess.Popen(WSL + ["-e", "sleep", "infinity"], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
 def ensure_ollama():
     """Make sure the WSL Ollama is reachable; boot WSL / start `ollama serve` if needed."""
+    with _ENSURE_LOCK:
+        return _ensure_ollama()
+
+
+def _ensure_ollama():
     wsl = WSL
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    if sys.platform == "win32":
-        # Keep the WSL VM alive while this tool runs (WSL idles out otherwise).
-        try:
-            subprocess.Popen(wsl + ["-e", "sleep", "infinity"], creationflags=flags,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            pass
-    for _ in range(20):
+    keep_wsl_alive()
+    for _ in range(40):  # WSL can take ~10-20 s to boot
         if ollama_up():
             return True
         time.sleep(0.5)
@@ -663,18 +679,23 @@ class Handler(BaseHTTPRequestHandler):
                 req = json.loads(self.body())
                 doc = self.get_doc(req["id"])
                 reader = req.get("model") or DEFAULT_MODEL
+                keep_wsl_alive()
 
                 def ask(model, prompt, png):  # one small cell per call
                     body = {"model": model, "stream": False, "keep_alive": "15m",
                             "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 200},
                             "messages": [{"role": "user", "content": prompt, "images": [base64.b64encode(png).decode()]}]}
-                    for attempt in range(3):  # Ollama occasionally drops a connection (e.g. while swapping models)
+                    for attempt in range(3):
                         try:
                             return ollama_request("/api/chat", body, timeout=600).get("message", {}).get("content", "")
                         except (OSError, http.client.HTTPException):
+                            # Dropped connection: usually WSL shutting down under Ollama. Bring it back
+                            # (keep-alive + wait for Ollama), then try the same cell again.
                             if attempt == 2:
                                 raise
-                            time.sleep(3 * (attempt + 1))
+                            time.sleep(2)
+                            if not ollama_up():
+                                ensure_ollama()
 
                 t0 = time.time()
                 out = mutation.read_page(doc[int(req["page"])], norm_rot(req.get("rot")), ask, reader,
