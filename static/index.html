@@ -251,7 +251,7 @@ const $ = s => document.querySelector(s);
 const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, busy: false, tab: 'table', rot: {}, shownRot: 0 };
 let grid = null;  // table editor (grid.js); holds the table data
 let mGrid = null; // mutation register table (fixed headers)
-const M = { flags: new Map(), notes: [], emptyPages: new Set(), cells: {}, running: false, halt: false };  // flags: "award|khata" -> {col: note}
+const M = { flags: new Map(), notes: [], emptyPages: new Set(), khataTotals: new Map(), cells: {}, running: false, halt: false };  // flags: "award|khata" -> {col: note}
 
 function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
 function busy(on) { state.busy = on; $('#spinner').style.display = on ? 'inline-block' : 'none'; refreshButtons(); }
@@ -510,6 +510,28 @@ const plotField = () => $('#mPlot').value;  // 'katat' or 'khasra': what column 
 const unitInfo = () => $('#mUnit').value === 'sqft' ? { label: 'Sq ft', per: 272 } : { label: 'Sarsai', per: 9 };
 const mKey = row => `${String(row[PAGE_COL] ?? '').trim()}|${String(row[1]).trim()}|${String(row[5]).trim()}`;
 const pageOf = row => String(row[PAGE_COL] ?? '').trim();
+// Khasra mode: each khata's khasra rows should add up to the khata's column-14 total (read from the page).
+// Returns Map "award|khata" -> message for the khatas that don't (recomputed on every change, so editing a
+// khasra's area from a correction document shows straight away whether the khata still balances).
+function khataMismatches() {
+  const out = new Map();
+  if (plotField() !== 'khasra' || !M.khataTotals.size) return out;
+  const per = unitInfo().per, units = (k, m, s) => (+k || 0) * 20 * per + (+m || 0) * per + (+s || 0);
+  const fmt = u => { u = Math.round(u * 100); const pk = 20 * per * 100, pm = per * 100, k = Math.floor(u / pk), m = Math.floor((u - k * pk) / pm); return `${k}-${m}-${(u - k * pk - m * pm) / 100}`; };
+  const sums = new Map();
+  for (const r of mGrid.rows) {
+    const key = `${String(r[1]).trim()}|${String(r[5]).trim()}`;
+    if (M.khataTotals.has(key)) sums.set(key, (sums.get(key) || 0) + units(r[7], r[8], r[9]));
+  }
+  for (const [key, got] of sums) {
+    const want = units(...M.khataTotals.get(key));
+    if (Math.abs(got - want) > 0.01) {
+      const [award, khata] = key.split('|');
+      out.set(key, `Award ${award}, khata ${khata}: the khasra areas add up to ${fmt(got)}, but the khata's total (column 14) is ${fmt(want)}.`);
+    }
+  }
+  return out;
+}
 const isKhasraOnly = row => plotField() === 'khasra' && /\d/.test(String(row[6])) && !String(row[5]).trim() && [7, 8, 9].every(c => !String(row[c]).trim());
 const isContinuation = row => (String(row[1]).trim() || String(row[5]).trim()) && [6, 7, 8, 9].every(c => !String(row[c]).trim());
 
@@ -548,11 +570,18 @@ mGrid = createGrid({
   cellClass: (r, c, row) => {
     if (c === 0) return 'sno';
     if (rowIssues(row).some(([col]) => col === c)) return 'warn';
+    if (c >= 7 && c <= 9 && M.mismatch && M.mismatch.has(`${String(row[1]).trim()}|${String(row[5]).trim()}`)) return 'warn';
     if (c >= 2 && c <= 4) return 'loc';  // from the batch details: check against the blue box on the page
     return isContinuation(row) && c >= 6 ? 'cont' : '';
   },
 });
-function mChanged() { mGrid.renumber(0); mRenderIssues(); mRenderTotals(); refreshButtons(); }
+function mChanged() {
+  const before = [...(M.mismatch || new Map()).keys()].join();
+  M.mismatch = khataMismatches();
+  mGrid.renumber(0);
+  if ([...M.mismatch.keys()].join() !== before) mGrid.render();  // repaint the area cells that went out of / back into balance
+  mRenderIssues(); mRenderTotals(); refreshButtons();
+}
 const mKeep = fn => () => { fn(); $('#mGridBox').focus({ preventScroll: true }); };
 $('#mUndo').onclick = mKeep(() => mGrid.undo());
 $('#mRedo').onclick = mKeep(() => mGrid.redo());
@@ -566,7 +595,7 @@ let mClearArmed = false;
 $('#mClear').onclick = e => {
   if (!mClearArmed) { mClearArmed = true; e.target.textContent = 'Click again to clear'; setTimeout(() => { mClearArmed = false; e.target.textContent = 'Clear all'; }, 3000); return; }
   mClearArmed = false; e.target.textContent = 'Clear all';
-  mGrid.clear(); M.flags.clear(); M.notes = []; M.emptyPages.clear(); M.cells = {}; drawCellBoxes(); mChanged(); status('Cleared (Ctrl+Z in the table brings the rows back).');
+  mGrid.clear(); M.flags.clear(); M.notes = []; M.emptyPages.clear(); M.khataTotals.clear(); M.cells = {}; drawCellBoxes(); mChanged(); status('Cleared (Ctrl+Z in the table brings the rows back).');
 };
 
 function mRenderIssues() {
@@ -577,7 +606,8 @@ function mRenderIssues() {
 }
 function mNotes() {  // per-page notes, plus one combined line for pages with nothing to add
   const empty = [...M.emptyPages].sort((a, b) => a - b);
-  return empty.length ? [...M.notes, `Nothing new to add on page${empty.length === 1 ? '' : 's'} ${empty.join(', ')} (more owners for the award, khasra numbers already in the table, or blank pages).`] : M.notes;
+  const notes = [...M.notes, ...(M.mismatch ? M.mismatch.values() : [])];
+  return empty.length ? [...notes, `Nothing new to add on page${empty.length === 1 ? '' : 's'} ${empty.join(', ')} (more owners for the award, khasra numbers already in the table, or blank pages).`] : notes;
 }
 function mTotals() {
   const per = unitInfo().per, groups = new Map();
@@ -649,7 +679,7 @@ async function mRead(pages) {
   if (!state.doc || M.running) return;
   M.running = true; M.halt = false; refreshButtons();
   const b = batch(), model = $('#model').value;
-  let added = 0, failed = 0, filledAll = 0;
+  let added = 0, failed = 0, replacedAll = 0;
   for (const n of pages) {
     if (M.halt) break;
     await showPage(n);
@@ -665,46 +695,56 @@ async function mRead(pages) {
     M.cells[n] = { rot: rotOf(n), boxes: j.records.flatMap(rec => Object.entries(rec.cells).map(([col, r]) => ({ col: +col, r }))) };
     if (j.location && j.records.length) M.cells[n].boxes.push({ col: 'loc', r: j.location });
     drawCellBoxes();
-    const rows = [];
-    let table = mGrid.rows.map(r => [...r]), filled = 0;
-    // Rows already taken from this page (it is being read again, e.g. after switching Katat/Khasra):
-    // the n-th entry on the page updates the n-th such row instead of adding a duplicate.
-    const earlier = table.filter(r => pageOf(r) === String(n + 1));
-    let nothingNew = j.records.length > 0;
-    j.records.forEach((rec, i) => {
-      if (rec.khasra_only && !earlier[i]) {
-        // Page with no khata or area but with khasra numbers: add only those not already in the table
-        // for this award (from any page).
-        const known = new Set(table.concat(rows).filter(r => String(r[1]).trim() === String(rec.award).trim())
-          .flatMap(r => String(r[6]).split(',').map(s => s.trim()).filter(Boolean)));
-        const fresh = rec.katat.split(',').map(s => s.trim()).filter(s => s && !known.has(s));
-        if (!fresh.length) return;
-        nothingNew = false;
-        rows.push(['', rec.award, b.district, b.tehsil, b.mouza, '', fresh.join(', '), '', '', '', String(n + 1)]);
-        return;
-      }
-      nothingNew = false;
-      const row = ['', rec.award, b.district, b.tehsil, b.mouza, rec.khata, rec.katat, rec.kanal, rec.marla, rec.sarsai, String(n + 1)];
-      const cols = { award: [1], khata: [5], katat: [6], area: [7, 8, 9] }, f = {};
-      (rec.flags || []).forEach(k => (cols[k] || []).forEach(c => { f[c] = rec.notes; }));
-      const same = earlier[i];
-      if (same) {
-        // Fill only the cells that are still empty, so nothing typed or corrected by hand is overwritten.
-        row.forEach((v, c) => { if (c > 0 && String(v ?? '').trim() && !String(same[c] ?? '').trim()) { same[c] = v; filled++; } });
-        if (Object.keys(f).length) M.flags.set(mKey(same), f); else M.flags.delete(mKey(same));  // latest read wins
-        return;
-      }
-      if (Object.keys(f).length) M.flags.set(mKey(row), f);
+    const page = String(n + 1), rows = [];
+    // A page read again replaces its earlier rows in place (Ctrl+Z restores them).
+    const others = mGrid.rows.filter(r => pageOf(r) !== page);
+    const firstOld = mGrid.rows.findIndex(r => pageOf(r) === page);
+    const replacing = firstOld >= 0;
+    const flagCols = { award: [1], khata: [5], katat: [6], area: [7, 8, 9], khasra_area: [6, 7, 8, 9] };
+    const push = (row, rec) => {
+      const f = {};
+      (rec.flags || []).forEach(k => (flagCols[k] || []).forEach(c => { f[c] = rec.notes; }));
+      if (Object.keys(f).length) M.flags.set(mKey(row), f); else M.flags.delete(mKey(row));
       rows.push(row);
-    });
-    if (nothingNew) M.emptyPages.add(n + 1);  // only khasra numbers already in the table
-    if (filled) { mGrid.setData(table); filledAll += filled; }  // one undoable step
+    };
+    const kms = s => (String(s || '').match(/^(\d+)-(\d+)-(\d+(?:\.\d+)?)$/) || []).slice(1);
+    for (const rec of j.records) {
+      const base = ['', rec.award, b.district, b.tehsil, b.mouza];
+      const items = plotField() === 'khasra' ? (rec.khasra_items || []) : [];
+      if (!items.length) {  // Katat mode, or no khasra list read: one row for the entry
+        push([...base, rec.khata, rec.katat, rec.kanal, rec.marla, rec.sarsai, page], rec);
+        continue;
+      }
+      let khata = rec.khata;
+      if (rec.khasra_only) {
+        // A khasra list continued from an earlier page: attach it to that page's khata for this award,
+        // and skip khasras (number + area) that are already in the table.
+        const prev = others.concat(rows).filter(r => String(r[1]).trim() === String(rec.award).trim() && String(r[5]).trim()
+          && (+pageOf(r) || 0) < n + 1).pop();
+        khata = prev ? prev[5] : '';
+        const seen = new Set(others.filter(r => String(r[1]).trim() === String(rec.award).trim()).map(r => `${String(r[6]).trim()}|${r[7]}-${r[8]}-${r[9]}`));
+        const fresh = items.filter(it => !seen.has(`${it.khasra}|${it.area}`));
+        if (!fresh.length) continue;
+        fresh.forEach(it => push([...base, khata, it.khasra, ...(kms(it.area).length ? kms(it.area) : ['', '', '']), page], rec));
+        continue;
+      }
+      // One row per khasra, each with its own area; remember the khata's column-14 total for the sum check.
+      if (rec.kanal || rec.marla || rec.sarsai) M.khataTotals.set(`${rec.award}|${khata}`, [rec.kanal, rec.marla, rec.sarsai]);
+      items.forEach(it => push([...base, khata, it.khasra, ...(kms(it.area).length ? kms(it.area) : ['', '', '']), page], rec));
+    }
+    if (!rows.length && j.records.length) M.emptyPages.add(n + 1);  // only khasras already in the table
+    if (replacing) {
+      const at = Math.min(firstOld, others.length);
+      mGrid.setData([...others.slice(0, at), ...rows, ...others.slice(at)]);  // one undoable step
+      replacedAll += 1;
+      rows.length = 0;
+    }
     if (rows.length) { mGrid.appendRows(rows); added += rows.length; }
     mChanged();
-    status(`Page ${n + 1}: ${j.records.length} entr${j.records.length === 1 ? 'y' : 'ies'} read in ${j.seconds}s${filled ? `, ${filled} empty cell${filled === 1 ? '' : 's'} filled in an existing row` : ''}.`);
+    status(`Page ${n + 1}: ${j.records.length} entr${j.records.length === 1 ? 'y' : 'ies'} read in ${j.seconds}s${replacing ? ' — this page\'s earlier rows were replaced (Ctrl+Z in the table brings them back)' : ''}.`);
   }
   M.running = false; $('#mProgress').textContent = ''; refreshButtons();
-  status(`${M.halt ? 'Stopped. ' : 'Done. '}${added} row${added === 1 ? '' : 's'} added${filledAll ? `, ${filledAll} empty cell${filledAll === 1 ? '' : 's'} filled in existing rows` : ''}${failed ? `, ${failed} page${failed === 1 ? '' : 's'} could not be read` : ''}. Check the highlighted cells against the outlined cells on the page.`, failed > 0);
+  status(`${M.halt ? 'Stopped. ' : 'Done. '}${added} row${added === 1 ? '' : 's'} added${replacedAll ? `, ${replacedAll} page${replacedAll === 1 ? '' : 's'} re-read (their rows replaced)` : ''}${failed ? `, ${failed} page${failed === 1 ? '' : 's'} could not be read` : ''}. Check the highlighted cells against the outlined cells on the page.`, failed > 0);
 }
 $('#mReadPage').onclick = () => mRead([state.page]);
 $('#mReadAll').onclick = () => mRead([...Array(state.pages).keys()]);

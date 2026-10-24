@@ -21,7 +21,7 @@ import re
 import pymupdf
 
 RENDER_LONG = 2000  # px, longest side used for finding the grid
-INK_MIN = 0.004     # a cell with less ink than this is treated as empty
+INK_MIN = 0.004     # a cell with less writing than this (see cell_ink) is treated as empty
 
 PROMPT_PLAIN = ("Transcribe all text in this image exactly as written, top to bottom, one line per printed line. "
                 "Keep digits, hyphens and slashes exactly. Output only the text.")
@@ -61,6 +61,29 @@ def parse_khasra(text):
     its own area): '37/24/1, 37/23/2, 47/3/1, 37/23/2'. The under-bar numbers are dropped."""
     t = re.sub(r"[ \t]*/[ \t]*", "/", _norm(text))  # '56 / 7 / 2' -> '56/7/2', without joining lines
     return ", ".join(re.findall(r"(?<![\d/])\d{1,5}(?:/\d{1,5})+(?![\d/])", t))
+
+
+def kms_units(k, m, s, per):
+    return float(k) * 20 * per + float(m) * per + float(s)
+
+
+def pair_khasra_areas(khasras, areas):
+    """Column 16 lists khasra numbers and column 17 the area of each, line for line; column 17 may end
+    with the total of those areas. Returns (items, total, problem): items = [{"khasra", "area"}] with
+    area as "K-M-S" ("" if missing), total = "K-M-S" or "", problem = a note when the counts or the
+    sum don't line up."""
+    fmt = lambda a: "-".join(a)
+    total, problem = "", ""
+    if areas and len(areas) == len(khasras) + 1:
+        *areas, last = areas
+        total = fmt(last)
+        # The third figure may be Sarsai (9 to a Marla) or sq ft (272): accept either.
+        if not any(abs(sum(kms_units(*a, per) for a in areas) - kms_units(*last, per)) < 0.01 for per in (9, 272)):
+            problem = f"column 17 areas don't add up to the total printed under them ({total})"
+    elif areas and len(areas) != len(khasras):
+        problem = f"column 16 lists {len(khasras)} khasra number(s) but column 17 has {len(areas)} area(s) — check which area goes with which khasra"
+    items = [{"khasra": k, "area": fmt(areas[i]) if i < len(areas) else ""} for i, k in enumerate(khasras)]
+    return items, total, problem
 
 
 def _plain_numbers(text):
@@ -328,6 +351,7 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
             # so take the full height and reach a little past that rule.
             x0, x1 = cols[15]
             cells[16] = (x0 + (x1 - x0) * 0.04, y0 + 0.003, x1 + (x1 - x0) * 0.06, y1 - 0.003)
+            cells[17] = rect(17, 0, 1.0)  # one area per khasra, line for line, sometimes a total at the end
         with lock:
             inked = {c: cell_ink(page, rot, r) >= INK_MIN for c, r in cells.items()}
             png = {c: cell_png(page, rot, r) for c, r in cells.items() if inked[c]}
@@ -365,11 +389,16 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
                 kanal, marla, sarsai = kms
             else:
                 notes.append("column 14 area could not be read"); flags.append("area"); conf = "low"
+        khasra_items, col17_total = [], ""
         if plot_field == "khasra":
             if inked[16]:
                 katat = parse_khasra(ask(reader_model, PROMPT_PLAIN, png[16]))
                 if not katat:
                     notes.append("khasra number in column 16 could not be read"); flags.append("katat"); conf = "low"
+            areas = KMS.findall(_norm(ask(reader_model, PROMPT_PLAIN, png[17]))) if inked[17] else []
+            khasra_items, col17_total, msg = pair_khasra_areas(katat.split(", ") if katat else [], areas)
+            if msg:
+                notes.append(msg); flags.append("khasra_area"); conf = "medium"
         elif inked[17]:
             total, katat = parse_total_katat(ask(reader_model, PROMPT_PLAIN, png[17]))
             if not katat:
@@ -382,12 +411,16 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
             # (khasra mode), which the caller adds if they aren't in the table yet.
             if not (plot_field == "khasra" and katat):
                 continue
-            khasra_only, notes, flags, conf = True, [], [], "high"
+            khasra_only = True  # keep only the khasra/area notes; khata and area are blank by design here
+            keep = [i for i, f in enumerate(flags) if f in ("katat", "khasra_area")]
+            notes = [n for n in notes if n.startswith(("khasra", "column 16", "column 17"))]
+            flags = [flags[i] for i in keep]
+            conf = "medium" if flags else "high"
         records.append({"award": award, "khata": khata, "katat": katat, "kanal": kanal, "marla": marla,
                         "sarsai": sarsai, "continuation": continuation, "confidence": conf, "notes": "; ".join(notes),
                         "flags": flags, "khasra_only": khasra_only,
-                        # the cells actually read (column 17 is only checked for ink in khasra mode)
-                        "cells": {str(c): r for c, r in cells.items() if not (c == 17 and plot_field == "khasra")}})
+                        "khasra_items": khasra_items, "col17_total": col17_total,
+                        "cells": {str(c): r for c, r in cells.items()}})  # the cells read, for outlining
     return {"ok": True, "records": records, "error": "", "grid": grid, "skew": round(skew, 2), "location": location}
 
 
@@ -423,11 +456,14 @@ def _unrotate(rect, rot):
 
 
 def cell_ink(page, rot, frac_rect):
-    """Share of dark pixels in a cell (borders trimmed). Blank cells are never sent to a model,
-    because that is exactly where small models invent text."""
+    """Amount of writing in a cell (borders trimmed), as dark pixels per square of the cell's width —
+    so one line of text counts the same in a short cell and in a tall, mostly blank one. Blank cells
+    are never sent to a model, because that is exactly where small models invent text."""
     x0, y0, x1, y1 = frac_rect
     dx, dy = (x1 - x0) * 0.06, (y1 - y0) * 0.02
-    w, h, s, st = _gray(cell_png(page, rot, (x0 + dx, y0 + dy, x1 - dx, y1 - dy), longest=300))
+    aspect = ((y1 - y0) * page.rect.height) / max(1e-6, (x1 - x0) * page.rect.width)
+    longest = int(150 * max(1.0, aspect))  # cell width ≈ 150 px whatever its height
+    w, h, s, st = _gray(cell_png(page, rot, (x0 + dx, y0 + dy, x1 - dx, y1 - dy), longest=longest))
     dark = [[s[y * st + x] < 140 for x in range(w)] for y in range(h)]
     # Ignore ruled lines that stray into the crop (a border that's still slightly sloped after
     # straightening): pixels in long straight runs are rules, not writing.
@@ -458,8 +494,44 @@ def cell_ink(page, rot, frac_rect):
                 y = e
             else:
                 y += 1
-    n = sum(1 for y in range(h) for x in range(w) if dark[y][x] and not rule[y][x])
-    return n / max(1, w * h)
+    # A rule that is very slightly slanted breaks into short straight pieces, but it is still one
+    # continuous stroke if a pixel of wobble either side is allowed. Writing has gaps (between
+    # characters, between lines), so it never forms such a long run.
+    for x in range(w):
+        lo, hi = max(0, x - 1), min(w, x + 2)
+        y = 0
+        while y < h:
+            if any(dark[y][lo:hi]):
+                e = y
+                while e < h and any(dark[e][lo:hi]):
+                    e += 1
+                if e - y >= 0.3 * h:
+                    for i in range(y, e):
+                        for xx in range(lo, hi):
+                            rule[i][xx] = True
+                y = e
+            else:
+                y += 1
+    for y in range(h):
+        rows3 = dark[max(0, y - 1):y + 2]
+        x = 0
+        while x < w:
+            if any(r[x] for r in rows3):
+                e = x
+                while e < w and any(r[e] for r in rows3):
+                    e += 1
+                if e - x >= 0.5 * w:
+                    for yy in range(max(0, y - 1), min(h, y + 2)):
+                        for i in range(x, e):
+                            rule[yy][i] = True
+                x = e
+            else:
+                x += 1
+    # Column rules sit at the cell's edges; after straightening a scan they can still lean across a
+    # few percent of a tall cell's width, in broken pieces. Writing has plenty of ink further in.
+    edge = int(0.1 * w)
+    n = sum(1 for y in range(h) for x in range(edge, w - edge) if dark[y][x] and not rule[y][x])
+    return n / max(1, w * w)
 
 
 def cell_png(page, rot, frac_rect, longest=900):
