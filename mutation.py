@@ -366,7 +366,7 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
             else:
                 notes.append("column 14 area could not be read"); flags.append("area"); conf = "low"
         if plot_field == "khasra":
-            if inked[16] and (inked[14] or inked[17]):  # continuation pages leave the new-entry half blank
+            if inked[16]:
                 katat = parse_khasra(ask(reader_model, PROMPT_PLAIN, png[16]))
                 if not katat:
                     notes.append("khasra number in column 16 could not be read"); flags.append("katat"); conf = "low"
@@ -375,13 +375,17 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
             if not katat:
                 notes.append("katat under the column 17 total could not be read"); flags.append("katat"); conf = "low"
         continuation = not inked[14] and not inked[17]
+        khasra_only = False
         if not khata and not (kanal or marla or sarsai):
             # Only more owners for the award, or a summary page (totals, share-transferred box) with no
-            # khata and no column-14 area: nothing to put in the table's columns.
-            continue
+            # khata and no column-14 area: nothing to put in the table — unless it lists khasra numbers
+            # (khasra mode), which the caller adds if they aren't in the table yet.
+            if not (plot_field == "khasra" and katat):
+                continue
+            khasra_only, notes, flags, conf = True, [], [], "high"
         records.append({"award": award, "khata": khata, "katat": katat, "kanal": kanal, "marla": marla,
                         "sarsai": sarsai, "continuation": continuation, "confidence": conf, "notes": "; ".join(notes),
-                        "flags": flags,
+                        "flags": flags, "khasra_only": khasra_only,
                         # the cells actually read (column 17 is only checked for ink in khasra mode)
                         "cells": {str(c): r for c, r in cells.items() if not (c == 17 and plot_field == "khasra")}})
     return {"ok": True, "records": records, "error": "", "grid": grid, "skew": round(skew, 2), "location": location}

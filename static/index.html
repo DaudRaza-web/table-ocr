@@ -510,11 +510,13 @@ const plotField = () => $('#mPlot').value;  // 'katat' or 'khasra': what column 
 const unitInfo = () => $('#mUnit').value === 'sqft' ? { label: 'Sq ft', per: 272 } : { label: 'Sarsai', per: 9 };
 const mKey = row => `${String(row[PAGE_COL] ?? '').trim()}|${String(row[1]).trim()}|${String(row[5]).trim()}`;
 const pageOf = row => String(row[PAGE_COL] ?? '').trim();
+const isKhasraOnly = row => plotField() === 'khasra' && /\d/.test(String(row[6])) && !String(row[5]).trim() && [7, 8, 9].every(c => !String(row[c]).trim());
 const isContinuation = row => (String(row[1]).trim() || String(row[5]).trim()) && [6, 7, 8, 9].every(c => !String(row[c]).trim());
 
 function rowIssues(row) {  // -> [[col or null, text]]
   const out = [], k = String(row[5]).trim(), b = batch();
   if (!isInt(row[1])) out.push([1, 'Award/mutation number missing']);
+  if (isKhasraOnly(row)) return out.concat([[null, 'Khasra only: this page adds khasra numbers but has no khata or area. Check whether they belong with another row.']]);
   if (!k) out.push([5, 'Khata Khatuni missing']);
   else {
     if (!/^\d+(\s+to\s+\d+)?(\s*,\s*\d+(\s+to\s+\d+)?)*$/.test(k)) out.push([5, 'Khata Khatuni format looks wrong (expected e.g. "133, 440 to 444")']);
@@ -575,7 +577,7 @@ function mRenderIssues() {
 }
 function mNotes() {  // per-page notes, plus one combined line for pages with nothing to add
   const empty = [...M.emptyPages].sort((a, b) => a - b);
-  return empty.length ? [...M.notes, `Nothing to add on page${empty.length === 1 ? '' : 's'} ${empty.join(', ')} (pages that only list more owners for the award, or blank pages).`] : M.notes;
+  return empty.length ? [...M.notes, `Nothing new to add on page${empty.length === 1 ? '' : 's'} ${empty.join(', ')} (more owners for the award, khasra numbers already in the table, or blank pages).`] : M.notes;
 }
 function mTotals() {
   const per = unitInfo().per, groups = new Map();
@@ -668,7 +670,20 @@ async function mRead(pages) {
     // Rows already taken from this page (it is being read again, e.g. after switching Katat/Khasra):
     // the n-th entry on the page updates the n-th such row instead of adding a duplicate.
     const earlier = table.filter(r => pageOf(r) === String(n + 1));
+    let nothingNew = j.records.length > 0;
     j.records.forEach((rec, i) => {
+      if (rec.khasra_only && !earlier[i]) {
+        // Page with no khata or area but with khasra numbers: add only those not already in the table
+        // for this award (from any page).
+        const known = new Set(table.concat(rows).filter(r => String(r[1]).trim() === String(rec.award).trim())
+          .flatMap(r => String(r[6]).split(',').map(s => s.trim()).filter(Boolean)));
+        const fresh = rec.katat.split(',').map(s => s.trim()).filter(s => s && !known.has(s));
+        if (!fresh.length) return;
+        nothingNew = false;
+        rows.push(['', rec.award, b.district, b.tehsil, b.mouza, '', fresh.join(', '), '', '', '', String(n + 1)]);
+        return;
+      }
+      nothingNew = false;
       const row = ['', rec.award, b.district, b.tehsil, b.mouza, rec.khata, rec.katat, rec.kanal, rec.marla, rec.sarsai, String(n + 1)];
       const cols = { award: [1], khata: [5], katat: [6], area: [7, 8, 9] }, f = {};
       (rec.flags || []).forEach(k => (cols[k] || []).forEach(c => { f[c] = rec.notes; }));
@@ -682,6 +697,7 @@ async function mRead(pages) {
       if (Object.keys(f).length) M.flags.set(mKey(row), f);
       rows.push(row);
     });
+    if (nothingNew) M.emptyPages.add(n + 1);  // only khasra numbers already in the table
     if (filled) { mGrid.setData(table); filledAll += filled; }  // one undoable step
     if (rows.length) { mGrid.appendRows(rows); added += rows.length; }
     mChanged();
