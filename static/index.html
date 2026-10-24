@@ -251,7 +251,7 @@ const $ = s => document.querySelector(s);
 const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, busy: false, tab: 'table', rot: {}, shownRot: 0 };
 let grid = null;  // table editor (grid.js); holds the table data
 let mGrid = null; // mutation register table (fixed headers)
-const M = { flags: new Map(), notes: [], emptyPages: new Set(), khataTotals: new Map(), cells: {}, running: false, halt: false };  // flags: "award|khata" -> {col: note}
+const M = { flags: new Map(), notes: [], emptyPages: new Set(), khataTotals: new Map(), cells: {}, running: false, halt: false, sinceCheck: 0 };  // flags: "award|khata" -> {col: note}
 
 function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
 function busy(on) { state.busy = on; $('#spinner').style.display = on ? 'inline-block' : 'none'; refreshButtons(); }
@@ -305,11 +305,18 @@ async function openFile(f) {
     if (state.doc) api('/api/close', { method: 'POST', body: JSON.stringify({ id: state.doc }) }).catch(() => {});
     const j = await api('/api/upload', { method: 'POST', headers: { 'X-Filename': encodeURIComponent(f.name).replace(/%20/g, ' ') }, body: f });
     Object.assign(state, { doc: j.id, pages: j.pages, page: 0, rot: {} });
+    // A new document starts clean: empty the mutation table (Ctrl+Z in the table restores it) and drop
+    // the models from memory so they load fresh for this document.
+    const hadRows = mGrid.hasData();
+    if (hadRows) mGrid.clear();
+    M.flags.clear(); M.notes = []; M.emptyPages.clear(); M.khataTotals.clear(); M.cells = {}; M.sinceCheck = 0;
+    mChanged();
+    api('/api/models/unload', { method: 'POST', body: JSON.stringify({ models: [$('#model').value, $('#tModel').value].filter(Boolean) }) }).catch(() => {});
     $('#fname').textContent = f.name;
     $('#pageCount').textContent = j.pages;
     $('#empty').hidden = true; $('#stage').hidden = false;
     await showPage(0, true);
-    status(`Loaded ${j.pages} page${j.pages > 1 ? 's' : ''}. Drag over the table to select it.`);
+    status(`Loaded ${j.pages} page${j.pages > 1 ? 's' : ''}.${hadRows ? ' The mutation table was cleared for the new document (Ctrl+Z in the table brings it back).' : ''}`);
   } catch (e) { status(e.message, true); }
   busy(false);
 }
@@ -675,19 +682,45 @@ function drawCellBoxes() {
   }
 }
 
+const HEALTH_EVERY = 10;  // pages between model health checks
+async function mHeal(models, n, afterProblem = false) {
+  status(afterProblem ? `Page ${n + 1} came back incomplete — checking the models…` : 'Routine model check…');
+  let h;
+  try { h = await api('/api/models/heal', { method: 'POST', body: JSON.stringify({ models }) }); }
+  catch (e) { h = { ok: false, action: 'failed', detail: e.message }; }
+  M.sinceCheck = 0;
+  if (h.action !== 'none') {
+    const what = h.action === 'reloaded' ? 'models reloaded' : h.action === 'restarted' ? 'Ollama restarted' : 'could not be fixed';
+    M.notes.push(`Model check before page ${n + 1}: ${what} — ${h.detail}${h.ok ? '' : '. Results from here on may be incomplete; try restarting the tool.'}`);
+    mRenderIssues();
+  }
+  return h;
+}
 async function mRead(pages) {
   if (!state.doc || M.running) return;
   M.running = true; M.halt = false; refreshButtons();
-  const b = batch(), model = $('#model').value;
+  const b = batch(), model = $('#model').value, models = [model, $('#tModel').value].filter(Boolean);
   let added = 0, failed = 0, replacedAll = 0;
   for (const n of pages) {
     if (M.halt) break;
     await showPage(n);
     $('#mProgress').textContent = pages.length > 1 ? `Page ${n + 1} (${pages.indexOf(n) + 1} of ${pages.length})…` : `Reading page ${n + 1}…`;
     status(`Reading page ${n + 1} with the local models… (the first page loads the models, ~30 s)`);
+    // Long runs can wear the model runtime down: test it every few pages, and whenever a page fails or
+    // comes back with values the model couldn't read; reload/restart it if needed, then read again.
+    if (M.sinceCheck >= HEALTH_EVERY) await mHeal(models, n);
     let j;
-    try { j = await api('/api/mutation/read', { method: 'POST', body: JSON.stringify({ id: state.doc, page: n, rot: rotOf(n), model, plot: plotField() }) }); }
-    catch (e) { M.notes.push(`Page ${n + 1}: ${e.message}`); failed++; continue; }
+    for (let attempt = 0; ; attempt++) {
+      try { j = await api('/api/mutation/read', { method: 'POST', body: JSON.stringify({ id: state.doc, page: n, rot: rotOf(n), model, plot: plotField() }) }); }
+      catch (e) { j = { ok: false, error: e.message, crashed: true }; }
+      const unreadable = j.ok && j.records.some(r => (r.flags || []).some(f => f === 'award' || f === 'area'));
+      if (!(j.crashed || unreadable) || attempt) break;
+      const h = await mHeal(models, n, true);
+      if (h.action === 'none') break;  // the models are fine: this page is just hard to read
+      status(`Reading page ${n + 1} again after the model ${h.action === 'restarted' ? 'restart' : 'reload'}…`);
+    }
+    M.sinceCheck++;
+    if (j.crashed) { M.notes = M.notes.filter(t => !t.startsWith(`Page ${n + 1}:`)); M.notes.push(`Page ${n + 1}: ${j.error}`); failed++; mRenderIssues(); continue; }
     M.notes = M.notes.filter(t => !t.startsWith(`Page ${n + 1}:`));
     M.emptyPages.delete(n + 1);
     if (!j.ok) { M.notes.push(`Page ${n + 1}: ${j.error}`); failed++; mRenderIssues(); continue; }

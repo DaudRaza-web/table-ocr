@@ -99,23 +99,129 @@ def ensure_ollama():
         return _ensure_ollama()
 
 
+def _wait_up(seconds):
+    """Poll Ollama until it answers or `seconds` have passed (time-based: a probe itself can take ~2 s)."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if ollama_up():
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def _ensure_ollama():
     wsl = WSL
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     keep_wsl_alive()
-    for _ in range(40):  # WSL can take ~10-20 s to boot
-        if ollama_up():
-            return True
-        time.sleep(0.5)
+    if _wait_up(15):  # WSL may be booting; Ollama starts with it
+        return True
     if sys.platform == "win32":
+        # Ollama is normally installed as a system service (its models live under the service's
+        # account), so start that first; a plain `ollama serve` is only the last resort.
+        try:
+            subprocess.run(wsl + ["-u", "root", "-e", "systemctl", "start", "ollama"], timeout=60,
+                           stdin=subprocess.DEVNULL, capture_output=True, creationflags=flags)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if _wait_up(20):
+            return True
         print("Ollama not reachable - starting `ollama serve` inside WSL ...")
         subprocess.Popen(wsl + ["-e", "bash", "-lc", "ollama serve"], creationflags=flags,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for _ in range(40):
-            if ollama_up():
-                return True
-            time.sleep(0.5)
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return _wait_up(20)
     return False
+
+
+# ------------------------------------------------------------ model health --
+# Every request to the models is independent (no context builds up between pages), but over a long run
+# the Ollama runtime can degrade — the two models nearly fill a 16 GB card — and calls start failing or
+# coming back empty. A tiny test image with known printed text shows whether a model still reads properly.
+
+CANARY_TEXT = ("3718", "2-14-0", "48/16/1/1")
+_CANARY = None
+
+
+def canary_png():
+    global _CANARY
+    if _CANARY is None:
+        doc = pymupdf.open()
+        page = doc.new_page(width=130, height=120)
+        for i, text in enumerate(CANARY_TEXT):
+            page.insert_text((14, 30 + i * 34), text, fontsize=17, fontname="helv")
+        _CANARY = page.get_pixmap(dpi=220, alpha=False).tobytes("png")
+    return _CANARY
+
+
+def model_health(models, slow_after=90):
+    """Read the test image with each model. -> {"ok", "detail", "seconds"}."""
+    t_all = time.time()
+    for model in models:
+        t0 = time.time()
+        try:
+            res = ollama_request("/api/chat", {
+                "model": model, "stream": False, "keep_alive": "15m",
+                "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 60},
+                "messages": [{"role": "user", "content": mutation.PROMPT_PLAIN,
+                              "images": [base64.b64encode(canary_png()).decode()]}],
+            }, timeout=180)
+        except Exception as e:
+            return {"ok": False, "detail": f"{model} did not answer ({type(e).__name__})", "seconds": round(time.time() - t_all, 1)}
+        seen = re.sub(r"\s+", "", mutation._norm(res.get("message", {}).get("content", "")))
+        missing = [t for t in CANARY_TEXT if t not in seen]
+        took = time.time() - t0
+        if missing:
+            return {"ok": False, "detail": f"{model} misread the test image (missed {', '.join(missing)})",
+                    "seconds": round(time.time() - t_all, 1)}
+        if took > slow_after:
+            return {"ok": False, "detail": f"{model} took {took:.0f}s on the test image", "seconds": round(time.time() - t_all, 1)}
+    return {"ok": True, "detail": "models read the test image correctly", "seconds": round(time.time() - t_all, 1)}
+
+
+def unload_models(models):
+    """Drop the models from memory; the next request loads them fresh."""
+    for model in models:
+        try:
+            ollama_request("/api/generate", {"model": model, "keep_alive": 0}, timeout=60)
+        except Exception:
+            pass
+
+
+def restart_ollama():
+    """Restart the Ollama service inside WSL (a clean runtime), then wait for it."""
+    if sys.platform == "win32":
+        try:
+            subprocess.run(WSL + ["-u", "root", "-e", "systemctl", "restart", "ollama"], timeout=90,
+                           stdin=subprocess.DEVNULL, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    time.sleep(2)
+    return ensure_ollama()
+
+
+_HEAL_LOCK = threading.Lock()
+
+
+def heal_models(models, force=None):
+    """Check the models and step up the remedy until they read the test image again:
+    nothing -> unload and reload -> restart Ollama. force="soft"/"hard" skips the first check.
+    -> {"ok", "action", "detail", "steps"}."""
+    with _HEAL_LOCK:
+        steps = []
+        if not force:
+            h = model_health(models)
+            steps.append(f"check: {h['detail']}")
+            if h["ok"]:
+                return {"ok": True, "action": "none", "detail": h["detail"], "steps": steps}
+        if force != "hard":
+            unload_models(models)
+            h = model_health(models)
+            steps.append(f"reloaded models: {h['detail']}")
+            if h["ok"]:
+                return {"ok": True, "action": "reloaded", "detail": h["detail"], "steps": steps}
+        restart_ollama()
+        h = model_health(models)
+        steps.append(f"restarted Ollama: {h['detail']}")
+        return {"ok": h["ok"], "action": "restarted", "detail": h["detail"], "steps": steps}
 
 
 def parse_rows(text):
@@ -260,7 +366,7 @@ def tesseract_cmd():
             _TESSERACT = ["tesseract"]
         elif sys.platform == "win32":
             try:
-                r = subprocess.run(WSL + ["-e", "which", "tesseract"], capture_output=True, timeout=20,
+                r = subprocess.run(WSL + ["-e", "which", "tesseract"], stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 if r.returncode == 0:
                     _TESSERACT = WSL + ["-e", "tesseract"]
@@ -720,6 +826,17 @@ class Handler(BaseHTTPRequestHandler):
                                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                  {"Content-Disposition": f'attachment; filename="{fname}"'})
 
+            if url.path == "/api/models/heal":
+                # {"models": [...], "force": null|"soft"|"hard"} -> check, and reload/restart if needed
+                req = json.loads(self.body() or b"{}")
+                models = [m for m in (req.get("models") or [DEFAULT_MODEL, TRANSLATE_MODEL]) if m]
+                return self.send(200, heal_models(models, req.get("force")))
+
+            if url.path == "/api/models/unload":
+                req = json.loads(self.body() or b"{}")
+                unload_models([m for m in (req.get("models") or [DEFAULT_MODEL, TRANSLATE_MODEL]) if m])
+                return self.send(200, {"ok": True})
+
             if url.path == "/api/close":
                 req = json.loads(self.body())
                 with DOCS_LOCK:
@@ -746,8 +863,10 @@ def lan_ips():
 
 
 def main():
-    print(f"Checking Ollama at {OLLAMA} ...")
-    print("Ollama OK" if ensure_ollama() else "WARNING: Ollama not reachable; extraction will fail until it is up.")
+    def check_ollama():  # in the background, so the tool opens straight away while WSL/Ollama boot
+        print(f"Checking Ollama at {OLLAMA} ...", flush=True)
+        print("Ollama OK" if ensure_ollama() else "WARNING: Ollama not reachable; extraction will fail until it is up.", flush=True)
+    threading.Thread(target=check_ollama, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://127.0.0.1:{PORT}/"
     print(f"Table OCR running at {url}  (Ctrl+C to stop)")

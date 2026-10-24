@@ -60,6 +60,12 @@ sudo apt install tesseract-ocr
 Without Tesseract, scanned pages lying on their side are still turned upright, but which way round is a guess,
 and upside-down scans aren't detected. (Vision LLMs turned out to be unreliable at telling upright from upside-down.)
 
+**Long runs:** the Mutation tab checks the models every 10 pages (and whenever a page fails or comes back
+incomplete) by reading a small test image. If they misread it, the models are reloaded, then Ollama is restarted
+(`systemctl restart ollama` in WSL), and the page is read again. Opening a new document clears the mutation table
+(Ctrl+Z restores it) and unloads the models so each document starts fresh. If Ollama is down, the tool starts the
+WSL service itself.
+
 If a pull stalls near the end, restart Ollama (`sudo systemctl restart ollama`) and pull again — it resumes.
 
 Other vision models in Ollama (e.g. `granite3.2-vision`, `qwen3-vl`, `llama3.2-vision`) show up in the model dropdown.
