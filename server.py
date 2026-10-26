@@ -354,42 +354,57 @@ def is_sideways(page):
 
 
 _TESSERACT = None
+_TESSERACT_CHECKED = 0.0
 
 
 def tesseract_cmd():
     """Tesseract on PATH, else (on Windows) inside WSL. [] if unavailable. Vision LLMs can't reliably tell
-    upright from upside-down; Tesseract's orientation detector can, for Latin and Arabic scripts alike."""
-    global _TESSERACT
-    if _TESSERACT is None:
-        _TESSERACT = []
-        if shutil.which("tesseract"):
-            _TESSERACT = ["tesseract"]
-        elif sys.platform == "win32":
-            try:
-                r = subprocess.run(WSL + ["-e", "which", "tesseract"], stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                if r.returncode == 0:
-                    _TESSERACT = WSL + ["-e", "tesseract"]
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-    return _TESSERACT
+    upright from upside-down; Tesseract's orientation detector can, for Latin and Arabic scripts alike.
+    Only success is remembered: a failed check (e.g. while WSL is still booting) is retried 20 s later."""
+    global _TESSERACT, _TESSERACT_CHECKED
+    if _TESSERACT or time.time() - _TESSERACT_CHECKED < 20:
+        return _TESSERACT or []
+    _TESSERACT_CHECKED = time.time()
+    if shutil.which("tesseract"):
+        _TESSERACT = ["tesseract"]
+    elif sys.platform == "win32":
+        keep_wsl_alive()
+        try:
+            r = subprocess.run(WSL + ["-e", "which", "tesseract"], stdin=subprocess.DEVNULL, capture_output=True, timeout=45,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if r.returncode == 0:
+                _TESSERACT = WSL + ["-e", "tesseract"]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return _TESSERACT or []
 
 
-def orientation_from_tesseract(png):
-    cmd = tesseract_cmd()
-    if not cmd:
-        return None
+def _osd(cmd, png):
+    """One Tesseract orientation check -> (rotation, confidence) or None."""
     try:
-        r = subprocess.run(cmd + ["stdin", "stdout", "--psm", "0"], input=png, capture_output=True, timeout=30,
+        r = subprocess.run(cmd + ["stdin", "stdout", "--psm", "0"], input=png, capture_output=True, timeout=45,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired):
         return None
     out = r.stdout.decode(errors="replace")
     rot = re.search(r"Rotate:\s*(\d+)", out)
     conf = re.search(r"Orientation confidence:\s*([\d.]+)", out)
-    if rot and conf and float(conf.group(1)) >= 1.0:
-        return norm_rot(rot.group(1))
-    return None
+    return (norm_rot(rot.group(1)), float(conf.group(1))) if rot and conf else None
+
+
+def orientation_from_tesseract(pngs):
+    """Try each rendering (sizes differ in what Tesseract can make out); keep the most confident answer."""
+    cmd = tesseract_cmd()
+    if not cmd:
+        return None
+    best = None
+    for png in pngs:
+        res = _osd(cmd, png)
+        if res and (best is None or res[1] > best[1]):
+            best = res
+        if best and best[1] >= 2.0:
+            break  # confident enough
+    return best[0] if best and best[1] >= 0.5 else None
 
 
 def detect_orientation(doc, page_no):
@@ -399,14 +414,19 @@ def detect_orientation(doc, page_no):
         rot = orientation_from_text(page)
         if rot is not None:
             return rot, "text"
-        zoom = 2000 / max(page.rect.width, page.rect.height)
-        png = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csGRAY, alpha=False).tobytes("png")
-    rot = orientation_from_tesseract(png)
+        pngs = []
+        for longest in (2000, 1300, 2800):
+            zoom = longest / max(page.rect.width, page.rect.height)
+            pngs.append(page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csGRAY, alpha=False).tobytes("png"))
+        portrait = page.rect.height > page.rect.width
+    rot = orientation_from_tesseract(pngs)
     if rot is not None:
         return rot, "tesseract"
     with DOCS_LOCK:
         sideways = is_sideways(doc[page_no])
-    if sideways:  # no Tesseract (or unsure): we know it's on its side, not which way
+    if sideways or (sideways is None and portrait):
+        # No sure answer from Tesseract. The register is a landscape form, so a page standing on its
+        # side is turned; which way is a guess the user can flip with the rotate buttons.
         return 90, "guess"
     return 0, "unknown"
 

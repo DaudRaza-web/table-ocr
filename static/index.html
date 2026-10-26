@@ -332,7 +332,8 @@ async function showPage(n, fit = false) {
       const j = await api(`/api/orient?id=${state.doc}&n=${n}`);
       state.rot[n] = j.rotation;
       if (j.rotation) status(`Page ${n + 1} auto-rotated ${j.rotation}°${j.method === 'guess' ? ' (direction is a guess — use ⟲ ⟳ if it is upside down)' : ''}.`);
-    } catch { state.rot[n] = 0; }
+      else if (j.method === 'unknown') status(`Page ${n + 1}: couldn't tell which way up it is — use ⟲ ⟳ if it's turned.`);
+    } catch (e) { status(`Page ${n + 1}: auto-rotate failed (${e.message}) — it will be tried again next time you open this page.`, true); }
     if (token !== state.showToken) return;  // user moved on to another page meanwhile
   }
   const rot = rotOf(n);
