@@ -246,7 +246,35 @@ def find_grid(page, rot=0):
         if len(verticals(a, b, 0.5)) < 9:
             break  # below the table
         rows.append((a / h, b / h))
-    return {"cols": cols, "rows": rows, "top": bands[num][0] / h, "size": (w, h)}
+    span = v[-1] - v[0]
+    fit = max(abs((x - v[0]) / span - t) for x, t in zip(v, FORM_RULES)) if span > 0 else 1.0
+    return {"cols": cols, "rows": rows, "top": bands[num][0] / h, "size": (w, h), "fit": fit}
+
+
+def orientation_from_grid(page):
+    """Which way up is the register? Try each turn and keep the one where the 17-column grid is found
+    with the form's own column layout (column 1 on the right) and its number row near the top. This
+    is far more reliable than Tesseract on these forms, whose mixed Urdu and digits confuse it.
+    -> rotation or None."""
+    best = None
+    # The register is a landscape form: a portrait scan is on its side, a landscape one upright or upside down.
+    turns = (90, 270) if page.rect.height > page.rect.width else (0, 180)
+    for rot in turns:
+        try:
+            g = find_grid(page, rot)
+            if not g:  # a tilted scan hides the rules: straighten and look again
+                skew = estimate_skew(page, rot)
+                if abs(skew) >= 0.1:
+                    g = find_grid(straightened(page, rot, skew, longest=2400), 0)
+        except Exception:
+            g = None
+        if not g or g["fit"] > 0.03 or g["top"] > 0.5:
+            continue
+        if best is None or g["fit"] < best[1]:
+            best = (rot, g["fit"])
+        if g["fit"] < 0.012:
+            break  # clearly the form, no need to try the others
+    return best[0] if best else None
 
 
 def _gray(png):

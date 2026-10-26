@@ -414,17 +414,24 @@ def detect_orientation(doc, page_no):
         rot = orientation_from_text(page)
         if rot is not None:
             return rot, "text"
+        rot = mutation.orientation_from_grid(page)  # register pages: the form's own grid says which way up
+        if rot is not None:
+            return rot, "grid"
         pngs = []
         for longest in (2000, 1300, 2800):
             zoom = longest / max(page.rect.width, page.rect.height)
             pngs.append(page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csGRAY, alpha=False).tobytes("png"))
         portrait = page.rect.height > page.rect.width
     rot = orientation_from_tesseract(pngs)
-    if rot is not None:
+    if rot is not None and (rot in (90, 270)) == portrait:
+        # A register page is a landscape form: portrait scans are on their side, landscape ones are
+        # upright or upside down. A Tesseract answer that contradicts the page shape is a misread.
         return rot, "tesseract"
+    if portrait:
+        return 90, "guess"
     with DOCS_LOCK:
         sideways = is_sideways(doc[page_no])
-    if sideways or (sideways is None and portrait):
+    if sideways:
         # No sure answer from Tesseract. The register is a landscape form, so a page standing on its
         # side is turned; which way is a guess the user can flip with the rotate buttons.
         return 90, "guess"
