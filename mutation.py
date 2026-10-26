@@ -235,9 +235,17 @@ def find_grid(page, rot=0):
     if i < len(bands) and len(bands[i][2]) < 12:
         i += 1          # group-heading row
     i += 1              # column-title row
-    # Everything below the titles, down to the table's bottom rule, is entry rows (their rules may be
-    # faint on continuation pages, so don't insist on seeing every column rule).
-    rows = [(a / h, b / h) for a, b, vv in bands[i:] if (b - a) > 0.02 * h]
+    # Entry rows run from the column titles down to the table's bottom rule. Below that, many forms
+    # print a boxed footer (lines 18-22: sale price, fee, signatures) whose frame looks like another
+    # ruled band, but the column rules don't continue through it. Rules can be faint on continuation
+    # pages, so be lenient (half the column rules, half the band's height) - the footer has only 2-3.
+    rows = []
+    for a, b, _ in bands[i:]:
+        if (b - a) <= 0.02 * h:
+            continue
+        if len(verticals(a, b, 0.5)) < 9:
+            break  # below the table
+        rows.append((a / h, b / h))
     return {"cols": cols, "rows": rows, "top": bands[num][0] / h, "size": (w, h)}
 
 
