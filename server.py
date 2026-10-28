@@ -716,7 +716,7 @@ def award_job_start(root, model, redo):
 
     def step(i, n, folder):
         with _AWARD_LOCK:
-            AWARD_JOB.update(i=i, n=n, folder=os.path.relpath(folder, root))
+            AWARD_JOB.update(i=i, n=n, folder=award_batch.folder_label(folder, root))
 
     def pick(folder, files):
         latest = max(files, key=award_batch.award_key)
@@ -724,16 +724,18 @@ def award_job_start(root, model, redo):
         _AWARD_ANSWER["path"] = None
         with _AWARD_LOCK:
             AWARD_JOB["question"] = {
-                "folder": os.path.relpath(folder, root),
+                "folder": award_batch.folder_label(folder, root),
                 "files": [{"path": f, "name": os.path.basename(f), "latest": f == latest}
                           for f in sorted(files, key=award_batch.award_key, reverse=True)],
                 "deadline": time.time() + award_batch.PICK_TIMEOUT}
         answered = _AWARD_ANSWER["event"].wait(award_batch.PICK_TIMEOUT)
         with _AWARD_LOCK:
             AWARD_JOB["question"] = None
+        if answered and _AWARD_ANSWER["path"] == "*all*":
+            return list(files), award_batch.ALL_HOW
         if answered and _AWARD_ANSWER["path"] in files:
-            return _AWARD_ANSWER["path"], "chosen by user"
-        return latest, f"auto - no answer in {award_batch.PICK_TIMEOUT // 60} minutes, latest award taken"
+            return [_AWARD_ANSWER["path"]], "chosen by user"
+        return [latest], f"auto - no answer in {award_batch.PICK_TIMEOUT // 60} minutes, latest award taken"
 
     def work():
         try:
@@ -949,7 +951,13 @@ class Handler(BaseHTTPRequestHandler):
                     page = doc[int(req["page"])]
                 rot = norm_rot(req.get("rot"))
                 if url.path == "/api/award/place":
-                    return self.send(200, {"place": award.read_place(page, chat, rot)})
+                    place, filled = award.read_place(page, chat, rot), []
+                    if any(not place.get(k) for k in ("district", "tehsil", "mouza")):
+                        # no such columns in the table: the award names them in its opening text
+                        with DOCS_LOCK:
+                            first = doc[0]
+                        place, filled = award.fill_place(place, award.read_place_doc(first, chat, norm_rot(req.get("rot0"))))
+                    return self.send(200, {"place": place, "from_text": filled})
                 cells = award.read_table(page, lambda png: parse_rows(chat(PROMPT, png, SCHEMA)), rot)
                 return self.send(200, {"found": cells is not None, "cells": cells or [],
                                        "seconds": round(time.time() - t0, 1)})

@@ -91,14 +91,24 @@ def find_folders(root):
     return out
 
 
+ALL_HOW = "all awards, repeated khasras left out"
+
+
+def folder_label(folder, root):
+    """Folder name for messages: its path under root, or its own name when it is the root."""
+    rel = os.path.relpath(folder, root)
+    return os.path.basename(os.path.normpath(folder)) if rel == "." else rel
+
+
 def pick_window(folder, files):
-    """Desktop window asking which award to use; the latest is taken after PICK_TIMEOUT. -> (path, how)"""
+    """Desktop window asking which award to use (or all of them); the latest is taken after PICK_TIMEOUT.
+    -> ([paths], how)"""
     latest = max(files, key=award_key)
     try:
         import tkinter as tk
     except ImportError:
-        return latest, "auto (no window available)"
-    choice = {"path": latest, "how": f"auto - no answer in {PICK_TIMEOUT // 60} minutes, latest award taken"}
+        return [latest], "auto (no window available)"
+    choice = {"path": [latest], "how": f"auto - no answer in {PICK_TIMEOUT // 60} minutes, latest award taken"}
     win = tk.Tk()
     win.title("Which award?")
     win.attributes("-topmost", True)
@@ -113,7 +123,11 @@ def pick_window(folder, files):
     end = time.time() + PICK_TIMEOUT
 
     def ok():
-        choice.update(path=var.get(), how="chosen by user")
+        choice.update(path=[var.get()], how="chosen by user")
+        win.destroy()
+
+    def use_all():
+        choice.update(path=list(files), how=ALL_HOW)
         win.destroy()
 
     def tick():
@@ -124,7 +138,10 @@ def pick_window(folder, files):
         timer.config(text=f"The latest award is used automatically in {left // 60}:{left % 60:02d}")
         win.after(1000, tick)
 
-    tk.Button(win, text="Use this award", command=ok, padx=10).pack(pady=(0, 12))
+    row = tk.Frame(win)
+    row.pack(pady=(0, 12))
+    tk.Button(row, text="Use this award", command=ok, padx=10).pack(side="left", padx=6)
+    tk.Button(row, text="Use all awards (skip repeated khasras)", command=use_all, padx=10).pack(side="left", padx=6)
     win.protocol("WM_DELETE_WINDOW", win.destroy)  # closing the window = take the latest
     tick()
     win.mainloop()
@@ -166,9 +183,40 @@ def process(srv, model, src, how, out_dir, max_pages, log):
     return path
 
 
+def process_many(srv, model, srcs, how, out_dir, max_pages, log):
+    """Several awards of one folder -> one Excel file: oldest first, khasras already in an earlier award
+    left out (award.combine)."""
+    ask_table, chat = askers(srv, model)
+    t0 = time.time()
+    results = []
+    for src in sorted(srcs, key=award_key):
+        log(f"  {os.path.basename(src)}")
+        results.append(award.extract(src, ask_table, chat, srv.tesseract_cmd(), max_pages=max_pages,
+                                     progress=lambda n, tot: log(f"    page {n + 1}/{tot}")))
+    comb = award.combine(results)
+    nos = list(dict.fromkeys((r["award"] or "").replace("/", "-") for r in results if r["award"]))
+    place = next((r["place"] for r in results if r["place"].get("mouza")), {})
+    path = os.path.join(out_dir, out_name({"award": " + ".join(nos), "place": place}))
+    total = comb["total"]
+    info = [("Source files", "; ".join(srcs)), ("Award chosen", how),
+            *[(f"Award {a} total (from the document)", f"{t[0]} K - {t[1]} M" if t else "not found")
+              for a, t in comb["totals"]],
+            ("Repeated khasras left out", f"{len(comb['ignored'])} ({comb['less'][0]} K - {comb['less'][1]} M)"),
+            ("Khasras listed", len(comb["rows"])),
+            ("Combined total", f"{total[0]} K - {total[1]} M" if total else "not worked out"),
+            ("Extracted", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))]
+    with open(path, "wb") as f:
+        f.write(award.build_xlsx(award.combined_rows(comb), info, comb["issues"]))
+    log(f"  -> {os.path.basename(path)}: {len(comb['rows'])} khasras ({len(comb['ignored'])} repeats left out), "
+        f"total {f'{total[0]}-{total[1]}' if total else 'not worked out'}, {len(comb['issues'])} issue(s), "
+        f"{time.time() - t0:.0f}s")
+    return path
+
+
 def run(srv, root, model, pick, log, redo=False, stop=lambda: False, max_pages=None, out=None, step=None):
     """Convert the award in every folder under `root`.
-    pick(folder, files) -> (path, how) when a folder has several awards; log(text); stop() -> True to halt
+    pick(folder, files) -> ([paths], how) when a folder has several awards (more than one path: combine
+    them); log(text); stop() -> True to halt
     after the current award; step(i, n, folder) reports progress. -> {"done", "skipped", "failed", "stopped"}"""
     folders = find_folders(root)
     fh = open(os.path.join(root, "Award Batch Log.txt"), "a", encoding="utf-8")
@@ -192,19 +240,22 @@ def run(srv, root, model, pick, log, redo=False, stop=lambda: False, max_pages=N
                 break
             if step:
                 step(i, len(folders), folder)
-            rel = os.path.relpath(folder, root)
+            rel = folder_label(folder, root)
             if done and not redo:
                 say(f"{rel}: already has its Excel file, skipped")
                 n["skipped"] += 1
                 continue
             if len(files) > 1:
                 say(f"{rel}: {len(files)} awards - asking which to use")
-                src, how = pick(folder, files)
+                srcs, how = pick(folder, files)
             else:
-                src, how = files[0], "only award in the folder"
-            say(f"{rel}: {os.path.basename(src)} ({how})")
+                srcs, how = files[:1], "only award in the folder"
+            say(f"{rel}: {', '.join(os.path.basename(s) for s in srcs)} ({how})")
             try:
-                process(srv, model, src, how, out or folder, max_pages, say)
+                if len(srcs) > 1:
+                    process_many(srv, model, srcs, how, out or folder, max_pages, say)
+                else:
+                    process(srv, model, srcs[0], how, out or folder, max_pages, say)
                 n["done"] += 1
             except Exception as e:
                 n["failed"] += 1

@@ -162,8 +162,9 @@ def build(pages):
             nums = [i for i in idx if NUM.match(cl[i])]
             if len(nums) >= 2 and nums[-1] == idx[-1] and nums[-2] == idx[-2] and len(idx) >= 3:
                 pre = cl[:nums[-2]]
+                k, m = cl[nums[-2]], cl[nums[-1]]
             else:
-                pre = cl  # no K/M read on this line
+                pre, k, m = cl, "", ""  # no K/M read on this line
                 issues.append(f"Page {page_no}: no K/M area on line '{joined}' - check this row")
             vals = [(i, x) for i, x in enumerate(pre) if x]
             if not vals:
@@ -191,7 +192,8 @@ def build(pages):
                 issues.append(f"Page {page_no}: khasra {name} appears twice (also on page {seen[name]}) - "
                               "a line may have been read twice")
             seen.setdefault(name, page_no)
-            rows.append({"khasra": name, "page": page_no})
+            # k/m are kept only to take repeated khasras out of a combined total; they are not reported
+            rows.append({"khasra": name, "page": page_no, "k": k, "m": m})
     return {"rows": rows, "total": total, "issues": issues}
 
 
@@ -221,6 +223,39 @@ def read_place(page, ask_json, rot=0):
         return {}
     return {"district": d.get("district", "").strip(), "tehsil": d.get("tehsil", "").strip(),
             "mouza": d.get("locality", "").strip()}
+
+
+DOC_PLACE_PROMPT = ("This is the first page of a land acquisition award. Find the district, the tehsil and the "
+                    "village / mouza / chak (locality) that the award is for, as written on the page (e.g. "
+                    '"Village Nazar Pakka, Tehsil & District Nankana Sahib"). Answer as JSON {"district": "", '
+                    '"tehsil": "", "locality": ""} with just the names (no "District"/"Tehsil"/"Village" words); '
+                    'use "" for one that is not on the page.')
+
+
+def read_place_doc(page, ask_json, rot=0):
+    """District / Tehsil / Locality from the text at the start of the award (for tables without those
+    columns)."""
+    r = page.rect
+    rect = pymupdf.Rect(0, 0, r.width, r.height * 0.6)
+    z = 1600 / max(rect.width, rect.height)
+    png = page.get_pixmap(matrix=pymupdf.Matrix(z, z).prerotate(rot), clip=rect, alpha=False).tobytes("png")
+    try:
+        d = json.loads(ask_json(DOC_PLACE_PROMPT, png, PLACE_SCHEMA))
+    except (ValueError, TypeError):
+        return {}
+    strip = lambda v, w: re.sub(rf"^\s*(?:{w})\.?\s*(?:no\.?)?\s*[:\-]?\s*", "", (v or "").strip(), flags=re.I).strip()  # noqa: E731
+    return {"district": strip(d.get("district"), "district"), "tehsil": strip(d.get("tehsil"), "tehsil"),
+            "mouza": strip(d.get("locality"), "village|mouza|mauza|locality")}
+
+
+def fill_place(place, doc_place):
+    """Place names from the table, with gaps filled from the document's opening text. -> (place, filled)"""
+    out, filled = dict(place or {}), []
+    for k in ("district", "tehsil", "mouza"):
+        if not out.get(k) and (doc_place or {}).get(k):
+            out[k] = doc_place[k]
+            filled.append(k)
+    return out, filled
 
 
 AWARD_NO = re.compile(r"Award\s*No\.?\s*:?\s*(\d{1,3})\s*(?:[/-]\s*(\d{4}))?", re.I)
@@ -273,9 +308,16 @@ def extract(path, ask_table, ask_json, cmd=None, max_pages=None, progress=None):
     elif res["total"] is None:
         issues.append("No total K-M found at the end of the land table" +
                       (f" (only the first {n_pages} pages were read)" if max_pages else ""))
-    for k, label in (("district", "District"), ("tehsil", "Tehsil"), ("mouza", "Locality/Mouza")):
+    labels = {"district": "District", "tehsil": "Tehsil", "mouza": "Locality/Mouza"}
+    if doc.page_count and any(not place.get(k) for k in labels):
+        # the table has no such columns: the award names them in its opening text
+        place, filled = fill_place(place, read_place_doc(doc[0], ask_json))
+        if filled:
+            issues.append(f"{', '.join(labels[k] for k in filled)} not in the table - taken from the start of the "
+                          "document; check")
+    for k, label in labels.items():
         if not place.get(k):
-            issues.append(f"{label} could not be read from the table - fill it in")
+            issues.append(f"{label} could not be read from the table or the document - fill it in")
     award = award_number(path, doc[0] if doc.page_count else None, cmd)
     if not award:
         issues.append("Award number not found in the file name or the page header")
@@ -294,6 +336,84 @@ def table_rows(award, place, rows, total):
             r["page"]] for i, r in enumerate(rows, 1)]
     k, m = total or ("", "")
     return out + [["", "", "", "", "", "Total", k, m, ""]]
+
+
+def _marla(k, m):
+    return int(k) * 20 + int(m)
+
+
+def _km(marla):
+    return marla // 20, marla % 20
+
+
+def combine(results):
+    """Several awards of one place, oldest first -> one land list.
+
+    A khasra already listed by an earlier award is left out (later awards and correction re-issues repeat
+    land). Each award's own total stays as printed; the combined total is their sum less the areas of the
+    khasras left out (read from the table, though not reported per khasra).
+    -> {"rows": [{"award", "place", "khasra", "page"}], "totals": [(award, (K, M) or None)], "less": (K, M),
+        "total": (K, M) or None, "ignored": [...], "issues": [...]}"""
+    rows, ignored, issues, earlier, whole = [], [], [], {}, set()
+    for res in results:
+        a = res["award"] or "?"
+        issues += [f"Award {a}: {t}" for t in res["issues"]]
+        kept = []
+        for r in res["rows"]:
+            if r["khasra"] in earlier:
+                ignored.append(dict(r, award=a, first=earlier[r["khasra"]], src=id(res)))
+            else:
+                kept.append(dict(r, award=a, place=res["place"]))
+        rows += kept
+        for r in kept:
+            earlier.setdefault(r["khasra"], a)
+        n_out = len(res["rows"]) - len(kept)
+        if res["rows"] and not kept:
+            issues.append(f"Award {a}: all {len(res['rows'])} khasras are already in an earlier award (the same award "
+                          "scanned twice?) - none added, and its whole total is left out")
+            if res["total"]:
+                whole.add(id(res))  # leave out its printed total, not the sum of its rows as read
+        elif n_out:
+            issues.append(f"Award {a}: {n_out} khasra(s) already in an earlier award, left out: "
+                          + ", ".join(f"{r['khasra']} (in {r['first']})" for r in ignored if r["award"] == a))
+            # the left-out areas come from the table rows: if those don't add up to the award's printed
+            # total, a row area was misread and the subtraction may be off too
+            areas = [r for r in res["rows"] if NUM.match(r.get("k") or "") and NUM.match(r.get("m") or "")]
+            got = sum(_marla(r["k"], r["m"]) for r in areas)
+            if res["total"] and (len(areas) < len(res["rows"]) or got != _marla(*res["total"])):
+                issues.append(f"Award {a}: its row areas add up to {_km(got)[0]}-{_km(got)[1]}, not its total "
+                              f"{res['total'][0]}-{res['total'][1]}, so the repeats left out may be off - check "
+                              "the left-out khasras' areas in the award")
+    less = sum(_marla(*res["total"]) for res in results if id(res) in whole)
+    for r in ignored:
+        if r["src"] in whole:
+            continue  # left out through its award's printed total above
+        if NUM.match(r.get("k") or "") and NUM.match(r.get("m") or ""):
+            less += _marla(r["k"], r["m"])
+        else:
+            issues.append(f"Award {r['award']}: the area of repeated khasra {r['khasra']} could not be read, so the "
+                          "combined total still includes it - check")
+    totals = [(res["award"] or "?", res["total"]) for res in results]
+    total = None
+    if all(t for _a, t in totals):
+        total = _km(sum(_marla(*t) for _a, t in totals) - less)
+    else:
+        issues.append("Combined total not worked out: award(s) " + ", ".join(a for a, t in totals if not t)
+                      + " have no total")
+    return {"rows": rows, "totals": totals, "less": _km(less), "total": total, "ignored": ignored, "issues": issues}
+
+
+def combined_rows(comb):
+    """Rows under HEADERS for combine(): the khasras, each award's own total, the repeated khasras left
+    out, and the combined Total."""
+    out = [[i, r["award"], r["place"].get("district", ""), r["place"].get("tehsil", ""), r["place"].get("mouza", ""),
+            r["khasra"], "", "", r["page"]] for i, r in enumerate(comb["rows"], 1)]
+    for a, t in comb["totals"]:
+        out.append(["", a, "", "", "", "Award total", *(t or ("", "")), ""])
+    if comb["ignored"]:
+        out.append(["", "", "", "", "", f"Less: {len(comb['ignored'])} repeated khasra(s)", *comb["less"], ""])
+    out.append(["", "", "", "", "", "Total", *(comb["total"] or ("", "")), ""])
+    return out
 
 
 def build_xlsx(rows, info, issues):
@@ -320,7 +440,7 @@ def build_xlsx(rows, info, issues):
         r = list(r) + [""] * (len(HEADERS) - len(r))
         # khasra numbers stay text ("2/19/1"); S.No., K, M and Page are numbers
         ws.append([num(r[0]), r[1], r[2], r[3], r[4], str(r[5]), num(r[6]), num(r[7]), num(r[8])])
-        bold = str(r[5]).strip().lower() == "total"
+        bold = bool(re.search(r"[A-Za-z]", str(r[5])))  # Total / Award total / Less rows
         for c in ws[ws.max_row]:
             c.border = box
             c.alignment = Alignment(horizontal="center")
