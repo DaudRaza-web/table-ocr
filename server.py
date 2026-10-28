@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import pymupdf
 
 import award
+import award_batch
 import mutation
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -688,6 +689,78 @@ def build_xlsx(title, rows, header, merges=()):
 
 # ------------------------------------------------------------------ HTTP ---
 
+# -------------------------------------------------------- award folder batch --
+# One folder conversion at a time, run in a background thread; the Award tab polls its state and answers
+# the "which award?" question for folders that hold several awards.
+
+AWARD_JOB = {"running": False, "log": [], "root": "", "i": 0, "n": 0, "folder": "", "question": None,
+             "result": None}
+_AWARD_LOCK = threading.Lock()
+_AWARD_ANSWER = {"event": threading.Event(), "path": None}
+_AWARD_STOP = threading.Event()
+
+
+def award_job_start(root, model, redo):
+    with _AWARD_LOCK:
+        if AWARD_JOB["running"]:
+            raise RuntimeError("A folder is already being converted.")
+        if not os.path.isdir(root):
+            raise RuntimeError(f"Folder not found: {root}")
+        AWARD_JOB.update(running=True, log=[], root=root, i=0, n=0, folder="", question=None, result=None)
+        _AWARD_STOP.clear()
+
+    def log(line):
+        with _AWARD_LOCK:
+            AWARD_JOB["log"].append(line)
+            del AWARD_JOB["log"][:-500]
+
+    def step(i, n, folder):
+        with _AWARD_LOCK:
+            AWARD_JOB.update(i=i, n=n, folder=os.path.relpath(folder, root))
+
+    def pick(folder, files):
+        latest = max(files, key=award_batch.award_key)
+        _AWARD_ANSWER["event"].clear()
+        _AWARD_ANSWER["path"] = None
+        with _AWARD_LOCK:
+            AWARD_JOB["question"] = {
+                "folder": os.path.relpath(folder, root),
+                "files": [{"path": f, "name": os.path.basename(f), "latest": f == latest}
+                          for f in sorted(files, key=award_batch.award_key, reverse=True)],
+                "deadline": time.time() + award_batch.PICK_TIMEOUT}
+        answered = _AWARD_ANSWER["event"].wait(award_batch.PICK_TIMEOUT)
+        with _AWARD_LOCK:
+            AWARD_JOB["question"] = None
+        if answered and _AWARD_ANSWER["path"] in files:
+            return _AWARD_ANSWER["path"], "chosen by user"
+        return latest, f"auto - no answer in {award_batch.PICK_TIMEOUT // 60} minutes, latest award taken"
+
+    def work():
+        try:
+            keep_wsl_alive()
+            res = award_batch.run(sys.modules[__name__], root, model, pick, log, redo=redo,
+                                  stop=_AWARD_STOP.is_set, step=step)
+        except Exception as e:
+            log(f"!! The batch stopped: {e}")
+            res = {"error": str(e)}
+        with _AWARD_LOCK:
+            AWARD_JOB.update(running=False, question=None, result=res)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def pick_folder_dialog():
+    """Native folder picker on this PC (the browser can't hand out folder paths). -> path or ''"""
+    import tkinter as tk
+    from tkinter import filedialog
+    win = tk.Tk()
+    win.withdraw()
+    win.attributes("-topmost", True)
+    path = filedialog.askdirectory(parent=win, title="Folder with award PDFs (subfolders are included)")
+    win.destroy()
+    return os.path.normpath(path) if path else ""
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("%s\n" % (fmt % args))
@@ -889,6 +962,40 @@ class Handler(BaseHTTPRequestHandler):
                 with DOCS_LOCK:
                     res["award"] = award.award_number(req.get("name", ""), doc[0] if doc is not None else None, cmd)
                 return self.send(200, res)
+
+            if url.path == "/api/award/browse":
+                return self.send(200, {"path": pick_folder_dialog()})
+
+            if url.path == "/api/award/scan":  # what a folder conversion would do, before starting it
+                root = json.loads(self.body()).get("root", "").strip().strip('"')
+                if not os.path.isdir(root):
+                    return self.send(200, {"ok": False, "error": f"Folder not found: {root}"})
+                folders = award_batch.find_folders(root)
+                return self.send(200, {"ok": True, "folders": len(folders), "done": sum(1 for f in folders if f[2]),
+                                       "multi": sum(1 for f in folders if len(f[1]) > 1)})
+
+            if url.path == "/api/award/batch/start":
+                req = json.loads(self.body())
+                award_job_start(req.get("root", "").strip().strip('"'), req.get("model") or DEFAULT_MODEL,
+                                bool(req.get("redo")))
+                return self.send(200, {"ok": True})
+
+            if url.path == "/api/award/batch/status":
+                with _AWARD_LOCK:
+                    job = dict(AWARD_JOB, log=AWARD_JOB["log"][-200:])
+                if job["question"]:
+                    job["question"] = dict(job["question"], seconds_left=max(0, int(job["question"]["deadline"] - time.time())))
+                return self.send(200, job)
+
+            if url.path == "/api/award/batch/answer":
+                _AWARD_ANSWER["path"] = json.loads(self.body()).get("path")
+                _AWARD_ANSWER["event"].set()
+                return self.send(200, {"ok": True})
+
+            if url.path == "/api/award/batch/stop":
+                _AWARD_STOP.set()
+                _AWARD_ANSWER["event"].set()  # an open "which award?" question takes the latest
+                return self.send(200, {"ok": True})
 
             if url.path == "/api/award/export":
                 req = json.loads(self.body())

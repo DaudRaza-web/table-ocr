@@ -40,6 +40,9 @@
   .gridbox { position: relative; outline: none; width: fit-content; min-width: 100%; }
   #mWrap, #aWrap { flex: 1; overflow: auto; padding: 12px; }
   .sheet td.tot { font-weight: 700; }
+  #aLog { margin: 6px 12px 0; max-height: 9.5em; overflow: auto; font-size: 12px; line-height: 1.35; background: color-mix(in srgb, var(--muted) 10%, transparent); padding: 6px 8px; border-radius: 6px; white-space: pre-wrap; }
+  #aAsk { max-width: 560px; border: 1px solid var(--line); border-radius: 10px; padding: 16px; background: var(--panel); color: var(--ink); }
+  #aAsk label { display: block; padding: 3px 0; font-size: 13px; }
   #aIssues { max-height: calc(5 * 1.45em + 4px); line-height: 1.45; overflow-y: auto; padding-right: 6px; }
   .mbatch input[type=text] { width: 9.5em; }
   .sheet th.named { white-space: nowrap; color: var(--ink); font-weight: 600; font-size: 12px; padding: 4px 8px; }
@@ -224,6 +227,24 @@
   </section>
 
   <section class="pane for-award" id="awardPane" hidden>
+    <div class="bar">
+      <label style="flex:1;display:flex;gap:6px;align-items:center">Folder <input type="text" id="aFolder" placeholder="e.g. D:\Danish Enterprises\Motorway\M3 Data" style="flex:1;min-width:12em"></label>
+      <button id="aBrowse" title="Pick the folder (the window opens on the PC running the tool)">Browse…</button>
+      <label title="Also convert folders that already have their Award … - Land.xlsx file"><input type="checkbox" id="aRedo"> Redo converted</label>
+      <button class="primary" id="aBatch" title="Convert the award in this folder and every subfolder, saving each Excel file next to its award">Convert folder</button>
+      <button id="aBatchStop" hidden>Stop</button>
+    </div>
+    <div id="aBatchBox" hidden>
+      <div id="aBatchState" class="hint" style="padding:6px 12px 0"></div>
+      <pre id="aLog"></pre>
+    </div>
+    <dialog id="aAsk">
+      <h3 style="margin:0 0 6px;font-size:15px">Which award should be used?</h3>
+      <div class="muted" id="aAskFolder" style="font-size:13px;margin-bottom:8px"></div>
+      <div id="aAskList"></div>
+      <div class="muted" id="aAskTimer" style="font-size:12px;margin:8px 0"></div>
+      <button class="primary" id="aAskOk">Use this award</button>
+    </dialog>
     <div class="bar mbatch">
       <label>Award No <input type="text" id="aAward" placeholder="e.g. 2/2015" style="width:7em"></label>
       <label>District <input type="text" id="aDistrict"></label>
@@ -285,6 +306,7 @@ const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, busy:
 let grid = null;  // table editor (grid.js); holds the table data
 let mGrid = null; // mutation register table (fixed headers)
 let aGrid = null; // award land table (fixed headers)
+const AB = { running: false, timer: null, asked: null };  // award folder conversion (server job)
 const M = { flags: new Map(), notes: [], emptyPages: new Set(), khataTotals: new Map(), alts: new Map(), cells: {}, running: false, halt: false, sinceCheck: 0 };  // flags: "award|khata" -> {col: note}
 
 function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
@@ -1003,10 +1025,85 @@ $('#aCopy').onclick = async () => {
   catch { status('Clipboard not available — use Download Excel.', true); }
 };
 
+// Folder conversion: the server walks the folder and its subfolders and saves each award's Excel file next
+// to it (award_batch.py); this polls the job, shows its log, and asks which award to use when a folder
+// has several (the latest is taken if nobody answers within 5 minutes).
+try { $('#aFolder').value = localStorage.getItem('a.folder') || ''; } catch {}
+$('#aFolder').addEventListener('change', () => { try { localStorage.setItem('a.folder', $('#aFolder').value.trim()); } catch {} });
+$('#aBrowse').onclick = async () => {
+  status('Pick the folder in the window that opened (it may be behind the browser)…');
+  try {
+    const j = await api('/api/award/browse', { method: 'POST', body: '{}' });
+    if (j.path) { $('#aFolder').value = j.path; $('#aFolder').dispatchEvent(new Event('change')); status('Folder selected.'); }
+    else status('No folder selected.');
+  } catch (e) { status(e.message, true); }
+};
+$('#aBatch').onclick = async () => {
+  const root = $('#aFolder').value.trim().replace(/^"|"$/g, '');
+  if (!root) { status('Type or browse to a folder first.', true); return; }
+  try {
+    const s = await api('/api/award/scan', { method: 'POST', body: JSON.stringify({ root }) });
+    if (!s.ok) { status(s.error, true); return; }
+    if (!s.folders) { status('No award PDFs found in that folder or its subfolders.', true); return; }
+    const todo = $('#aRedo').checked ? s.folders : s.folders - s.done;
+    if (!confirm(`${s.folders} folder${s.folders === 1 ? '' : 's'} with awards found` +
+      `${s.done && !$('#aRedo').checked ? ` (${s.done} already converted, skipped)` : ''}. Convert ${todo} now?` +
+      `${s.multi ? `\n\n${s.multi} folder${s.multi === 1 ? ' has' : 's have'} more than one award — you'll be asked which to use (the latest is taken after 5 minutes).` : ''}`)) return;
+    await api('/api/award/batch/start', { method: 'POST', body: JSON.stringify({ root, model: $('#model').value, redo: $('#aRedo').checked }) });
+    abPoll();
+  } catch (e) { status(e.message, true); }
+};
+$('#aBatchStop').onclick = async () => { await api('/api/award/batch/stop', { method: 'POST', body: '{}' }).catch(() => {}); status('Stopping after the current award…'); };
+$('#aAskOk').onclick = async () => {
+  const pick = document.querySelector('input[name=aPick]:checked');
+  $('#aAsk').close(); AB.asked = null;
+  await api('/api/award/batch/answer', { method: 'POST', body: JSON.stringify({ path: pick ? pick.value : '' }) }).catch(e => status(e.message, true));
+};
+function abAsk(q) {
+  const key = q.folder + q.files.map(f => f.path).join();
+  if (AB.asked !== key) {  // a new question: fill the list once, so the user's choice isn't reset by polling
+    AB.asked = key;
+    $('#aAskFolder').textContent = `${q.folder} has ${q.files.length} awards:`;
+    const list = $('#aAskList'); list.innerHTML = '';
+    q.files.forEach(f => {
+      const l = document.createElement('label'), r = document.createElement('input');
+      r.type = 'radio'; r.name = 'aPick'; r.value = f.path; r.checked = f.latest;
+      l.append(r, ' ' + f.name + (f.latest ? '  (latest)' : '')); list.append(l);
+    });
+    if (!$('#aAsk').open) $('#aAsk').showModal();
+  }
+  $('#aAskTimer').textContent = `The latest award is used automatically in ${Math.floor(q.seconds_left / 60)}:${String(q.seconds_left % 60).padStart(2, '0')}`;
+}
+async function abPoll() {
+  clearTimeout(AB.timer);
+  let j;
+  try { j = await api('/api/award/batch/status', { method: 'POST', body: '{}' }); } catch { AB.timer = setTimeout(abPoll, 4000); return; }
+  AB.running = j.running;
+  if (j.running || j.log.length) {
+    $('#aBatchBox').hidden = false;
+    const pre = $('#aLog'), atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+    pre.textContent = j.log.join('\n');
+    if (atEnd) pre.scrollTop = pre.scrollHeight;
+    const r = j.result;
+    $('#aBatchState').textContent = j.running ? (j.n ? `Converting ${j.root} — folder ${j.i + 1} of ${j.n}: ${j.folder}` : `Starting on ${j.root}…`)
+      : r && r.error ? `Stopped with an error: ${r.error}`
+      : r ? `Finished: ${r.done} converted, ${r.skipped} skipped, ${r.failed} failed${r.stopped ? ' (stopped)' : ''}. Each Excel file is saved next to its award; the log is in "Award Batch Log.txt" in the folder.` : '';
+  }
+  if (j.question) abAsk(j.question);
+  else if ($('#aAsk').open) { $('#aAsk').close(); AB.asked = null; }  // answered elsewhere or timed out
+  refreshButtons();
+  if (j.running) AB.timer = setTimeout(abPoll, 2000);
+  else if (j.result && !j.result.error) status(`Folder conversion finished: ${j.result.done} converted, ${j.result.skipped} skipped, ${j.result.failed} failed.`, j.result.failed > 0);
+}
+abPoll();  // pick up a conversion that is already running (page reloaded, or opened from another PC)
+
 function refreshButtons() {
   const has = !!state.doc;
   if (aGrid) {
-    $('#aRead').disabled = !has || A.running || state.busy || M.running;
+    $('#aBatch').disabled = AB.running || A.running;
+    $('#aBrowse').disabled = AB.running;
+    $('#aBatchStop').hidden = !AB.running;
+    $('#aRead').disabled = !has || A.running || state.busy || M.running || AB.running;
     $('#aStop').hidden = !A.running || state.tab !== 'award';
     $('#aProgress').hidden = !A.running || state.tab !== 'award';
     for (const id of ['aExport', 'aCopy', 'aDelRow', 'aClear']) $('#' + id).disabled = !aGrid.hasData() || A.running;
