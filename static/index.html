@@ -879,7 +879,9 @@ async function mRead(pages) {
           .sort((a, c) => (+pageOf(a) || 0) - (+pageOf(c) || 0)).pop();
         khata = prev ? prev[5] : '';
         base[1] = award || (prev ? prev[1] : '');
-        const seen = new Set(others.filter(r => String(r[1]).trim() === String(base[1]).trim()).map(r => `${String(r[6]).trim()}|${r[7]}-${r[8]}-${r[9]}`));
+        // (only under the same khata: the same khasra under another khata is a separate entry)
+        const seen = new Set(others.filter(r => String(r[1]).trim() === String(base[1]).trim() && String(r[5]).trim() === String(khata).trim())
+          .map(r => `${String(r[6]).trim()}|${r[7]}-${r[8]}-${r[9]}`));
         const fresh = items.filter(it => !seen.has(`${it.khasra}|${it.area}`));
         if (!fresh.length) continue;
         fresh.forEach(it => push([...base, khata, it.khasra, ...(kms(it.area).length ? kms(it.area) : ['', '', '']), page], rec));

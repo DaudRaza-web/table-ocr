@@ -6,7 +6,8 @@ Each mutation document (Register Dakhil Kharij pages) is read with the register 
 khasra mode). One row per khasra: Mutation No, Khata Khatuni, Khasra No.; the areas are not listed
 per khasra, only the document's total at the end: its grand total (میزان کل) when printed, otherwise
 the khatas' printed sub-totals added up. District / Tehsil / Mouza come from the award document in the
-same folder (its converted Excel file if there is one), not from the mutation.
+same folder (its converted Excel file if there is one), not from the mutation. A Word file with the
+same name lists the place, then each khata with its khasras.
 
 Documents that can't be read, or with more than 30% of their data missing, get a
 "<name> - REVIEW MANUALLY.txt" note next to them. The models are checked every few pages and after any
@@ -197,7 +198,9 @@ def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: Fa
             khata = rec["khata"] or (last_khata.get(mut, "") if rec["khasra_only"] else "")
             if rec["khata"]:
                 last_khata[mut] = rec["khata"]
-            seen = {r["khasra"] for r in rows if r["mut"] == mut} if rec["khasra_only"] else set()
+            # a continuation page can repeat khasras already listed for this khata; the same khasra under
+            # another khata is a separate entry and is kept
+            seen = {r["khasra"] for r in rows if r["mut"] == mut and r["khata"] == khata} if rec["khasra_only"] else set()
             for it in rec["khasra_items"]:
                 if it["khasra"] in seen:
                     continue  # a continuation page repeating khasras already listed
@@ -249,6 +252,59 @@ def heal(srv, models, log):
     return h
 
 
+# -------------------------------------------------------------------- word --
+
+def _xml(text):
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def docx_bytes(paragraphs):
+    """A minimal Word document. paragraphs: [[(text, bold), ...], ...] (an empty list is a blank line).
+    Written directly (three XML parts in a zip) so the tool needs no extra package."""
+    import io
+    import zipfile
+
+    def run(text, bold):
+        props = "<w:rPr><w:b/></w:rPr>" if bold else ""
+        return f'<w:r>{props}<w:t xml:space="preserve">{_xml(text)}</w:t></w:r>'
+
+    body = "".join(f"<w:p>{''.join(run(t, b) for t, b in p)}</w:p>" for p in paragraphs)
+    document = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                f'<w:body>{body}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+                '<w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="567" w:footer="567" w:gutter="0"/>'
+                '</w:sectPr></w:body></w:document>')
+    types = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+             '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+             '<Default Extension="xml" ContentType="application/xml"/>'
+             '<Override PartName="/word/document.xml" '
+             'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+    rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            'Target="word/document.xml"/></Relationships>')
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", document)
+    return buf.getvalue()
+
+
+def summary_paragraphs(rows, place):
+    """District / Tehsil / Village, then each khata (in order of first appearance) with its khasras."""
+    out = [[("District: ", True), (place.get("district", ""), False)],
+           [("Tehsil: ", True), (place.get("tehsil", ""), False)],
+           [("Village/Mouza: ", True), (place.get("mouza", ""), False)]]
+    khatas = {}
+    for r in rows:
+        khatas.setdefault(r["khata"] or "(not read)", []).append(r["khasra"])
+    for khata, khasras in khatas.items():
+        out += [[], [(f"Khata Khatuni# {khata}: ", True), (", ".join(khasras), False)]]
+    return out
+
+
 # ------------------------------------------------------------------- excel --
 
 def write_outputs(path, res, place, place_src):
@@ -294,6 +350,8 @@ def write_outputs(path, res, place, place_src):
     with open(xlsx, "wb") as f:
         f.write(award.build_xlsx(rows, info, issues, headers=HEADERS, widths=WIDTHS, text_cols=(1, 5, 6),
                                  title="Mutation Land"))
+    with open(re.sub(r"\.xlsx$", ".docx", xlsx), "wb") as f:  # the same land list as a Word summary
+        f.write(docx_bytes(summary_paragraphs(res["rows"], place)))
     return xlsx, review, rows
 
 
