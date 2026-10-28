@@ -5,7 +5,7 @@ Run from the web UI's "Mutation batch" tab (server.py), through run().
 Each mutation document (Register Dakhil Kharij pages) is read with the register reader (mutation.py,
 khasra mode). One row per khasra: Mutation No, Khata Khatuni, Khasra No.; the areas are not listed
 per khasra, only the document's total at the end: its grand total (میزان کل) when printed, otherwise
-the khatas' printed sub-totals added up. District / Tehsil / Mouza come from the award document in the
+the khatas' printed sub-totals added up - one total for each mutation number in the document. District / Tehsil / Mouza come from the award document in the
 same folder (its converted Excel file if there is one), not from the mutation. A Word file with the
 same name lists the place, then each khata with its khasras.
 
@@ -136,7 +136,7 @@ def add_areas(areas):
 
 
 def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: False):
-    """One mutation PDF -> {"rows", "total", "total_kind", "subtotals", "issues", "missing", "unreadable",
+    """One mutation PDF -> {"rows", "totals" (one per mutation number), "issues", "missing", "unreadable",
     "numbers", "pages"}. live(rows, page, pages) is called after each page with the table so far."""
     doc = pymupdf.open(path)
     named = numbers_in_name(path)
@@ -193,7 +193,8 @@ def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: Fa
             if rec["award"]:
                 last_mut = rec["award"]
             if rec.get("total_only") or (not rec["khasra_items"] and rec["col17_total"] and not rec["khasra_only"]):
-                totals_only.append((rec["col17_total"], n + 1))  # a total with no khasras: maybe the grand total
+                # a total with no khasras: maybe this mutation's grand total
+                totals_only.append((mut, rec["col17_total"], n + 1))
                 continue
             if rec["continuation"] and not rec["khasra_items"]:
                 continue  # more owners of the same entry
@@ -207,16 +208,17 @@ def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: Fa
             khata = rec["khata"] or (last_khata.get(mut, "") if rec["khasra_only"] else "")
             if rec["khata"]:
                 last_khata[mut] = rec["khata"]
-            # a continuation page can repeat khasras already listed for this khata; the same khasra under
-            # another khata is a separate entry and is kept
-            seen = {r["khasra"] for r in rows if r["mut"] == mut and r["khata"] == khata} if rec["khasra_only"] else set()
-            for it in rec["khasra_items"]:
-                if it["khasra"] in seen:
-                    continue  # a continuation page repeating khasras already listed
+            # A later page can repeat khasras already listed for this mutation and khata (a continuation
+            # page, or the entry printed again with the order text): those are left out. The same khasra
+            # under another khata is a separate entry and is kept, as are repeats within one entry.
+            seen = {r["khasra"] for r in rows if r["mut"] == mut and r["khata"] == khata}
+            new = [it for it in rec["khasra_items"] if it["khasra"] not in seen]
+            for it in new:
                 rows.append({"mut": mut, "khata": khata, "khasra": it["khasra"], "page": n + 1})
                 expected += 3
                 missing += (not mut) + (not khata)
-            if rec["col17_total"]:
+            if rec["col17_total"] and (new or rec["khasra_only"]) and \
+                    not any(s[:3] == (mut, khata, rec["col17_total"]) for s in subtotals):
                 subtotals.append((mut, khata, rec["col17_total"], n + 1))
             for note in filter(None, (rec.get("notes") or "").split("; ")):
                 if not note.startswith("column 14"):
@@ -224,34 +226,43 @@ def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: Fa
         if live:
             live(table(), n + 1, doc.page_count)
 
-    # Total: the grand total printed at the end (a column 17 area with no khasras after the last entry,
-    # at least the khatas' sub-totals added up), else the printed sub-totals added up.
-    total, kind = None, ""
-    sub = [a for a in (_kms(s[2]) for s in subtotals) if a]
-    sub_sum, unit = add_areas(sub) if sub else (None, "")
-    if totals_only:
-        g = _kms(totals_only[-1][0])
-        per = 272 if unit == "Sq ft" or (g and g[2] >= 9) else 9
-        size = lambda a: a[0] * 20 * per + a[1] * per + a[2]  # noqa: E731
-        if g and (not sub or size(g) + 0.01 >= size(sub_sum)):
-            unit = unit or ("Sq ft" if per == 272 else "Sarsai")
-            total, kind = g, f"grand total printed on page {totals_only[-1][1]}"
-        elif g:
-            issues.append(f"Page {totals_only[-1][1]}: area {totals_only[-1][0]} with no khasras is smaller than the "
-                          "khata sub-totals added up, so it was not taken as the grand total")
-    if total is None and sub:
-        total, kind = sub_sum, f"no grand total printed - sum of {len(sub)} khata sub-total(s)"
-        if len(sub) < len(subtotals):
-            issues.append("Some khata sub-totals could not be read and are not in the total")
-    if total is None:
-        issues.append("No total or khata sub-totals found in the document")
     numbers = list(dict.fromkeys(r["mut"] for r in rows if r["mut"])) or named
+    totals = [mutation_total(m, subtotals, totals_only, issues) for m in (numbers or [""])]
+    numbers = numbers or named
     ratio = (missing / expected) if expected else 1.0
     page_ratio = failed / doc.page_count if doc.page_count else 1.0
     unreadable = not rows
-    return {"rows": rows, "table": table(), "total": total, "total_kind": kind, "unit": unit,
-            "subtotals": subtotals, "issues": issues, "missing": max(ratio, page_ratio), "unreadable": unreadable,
-            "failed_pages": failed, "numbers": numbers, "pages": doc.page_count}
+    return {"rows": rows, "table": table(), "totals": totals, "issues": issues, "missing": max(ratio, page_ratio),
+            "unreadable": unreadable, "failed_pages": failed, "numbers": numbers, "pages": doc.page_count}
+
+
+def mutation_total(mut, subtotals, totals_only, issues):
+    """One mutation's total: its grand total (a column 17 area with no khasras after its entries, at
+    least its khata sub-totals added up), else its printed sub-totals added up.
+    -> {"mut", "total": (K, M, S) or None, "kind", "unit", "subs": [(mut, khata, area, page)]}"""
+    subs = [s for s in subtotals if s[0] == mut]
+    sub = [a for a in (_kms(s[2]) for s in subs) if a]
+    sub_sum, unit = add_areas(sub) if sub else (None, "")
+    label = f"Mutation {mut}" if mut else "The document"
+    grands = [t for t in totals_only if t[0] == mut]
+    if grands:
+        _m, area, page = grands[-1]
+        g = _kms(area)
+        per = 272 if unit == "Sq ft" or (g and g[2] >= 9) else 9
+        size = lambda a: a[0] * 20 * per + a[1] * per + a[2]  # noqa: E731
+        if g and (not sub or size(g) + 0.01 >= size(sub_sum)):
+            return {"mut": mut, "total": g, "kind": f"grand total printed on page {page}", "subs": subs,
+                    "unit": unit or ("Sq ft" if per == 272 else "Sarsai")}
+        if g:
+            issues.append(f"{label}: area {area} on page {page} with no khasras is smaller than its khata sub-totals "
+                          "added up, so it was not taken as the grand total")
+    if sub:
+        if len(sub) < len(subs):
+            issues.append(f"{label}: some khata sub-totals could not be read and are not in its total")
+        return {"mut": mut, "total": sub_sum, "kind": f"no grand total printed - sum of {len(sub)} khata sub-total(s)",
+                "subs": subs, "unit": unit}
+    issues.append(f"{label}: no total or khata sub-totals found")
+    return {"mut": mut, "total": None, "kind": "", "subs": subs, "unit": ""}
 
 
 def heal(srv, models, log):
@@ -336,20 +347,15 @@ def write_outputs(path, res, place, place_src):
                     + ("\nNotes from the extraction:\n" + "".join(f"- {t}\n" for t in res["issues"]) if res["issues"] else ""))
     if res["unreadable"]:
         return "", review, []
-    rows = [list(r) for r in res["table"]]
-    t = res["total"]
-    if t and not res["total_kind"].startswith("grand"):
-        for mut, khata, area, page in res["subtotals"]:
-            a = _kms(area)
-            if a:
-                rows.append(["", mut, "", "", "", khata, "Sub-total", a[0], a[1], _fmt3(a[2]), page])
-    rows.append(["", "", "", "", "", "", "Total", *(t[:2] if t else ("", "")), _fmt3(t[2]) if t else "", ""])
+    rows = [list(r) for r in res["table"]] + total_rows(res["totals"])
     info = [("Source file", path), ("District / Tehsil / Mouza from", place_src or "not found - fill them in"),
-            ("Pages", res["pages"]), ("Khasras listed", len(res["rows"])),
-            ("Total", f"{t[0]}-{t[1]}-{_fmt3(t[2])} ({res['total_kind']}; third figure read as {res['unit'] or 'Sarsai'})"
-             if t else "not found"),
-            ("Data missing (estimate)", f"{res['missing']:.0%}"),
-            ("Extracted", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))]
+            ("Pages", res["pages"]), ("Khasras listed", len(res["rows"]))]
+    for mt in res["totals"]:
+        t = mt["total"]
+        info.append((f"Total, mutation {mt['mut']}" if mt["mut"] else "Total",
+                     f"{fmt_kms(t)} ({mt['kind']}; third figure read as {mt['unit'] or 'Sarsai'})" if t else "not found"))
+    info += [("Data missing (estimate)", f"{res['missing']:.0%}"),
+             ("Extracted", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))]
     issues = list(res["issues"])
     if review:
         issues.insert(0, "REVIEW MANUALLY: " + "; ".join(reasons))
@@ -362,6 +368,25 @@ def write_outputs(path, res, place, place_src):
     with open(re.sub(r"\.xlsx$", ".docx", xlsx), "wb") as f:  # the same land list as a Word summary
         f.write(docx_bytes(summary_paragraphs(res["rows"], place)))
     return xlsx, review, rows
+
+
+def fmt_kms(t):
+    return f"{t[0]}-{t[1]}-{_fmt3(t[2])}" if t else "not found"
+
+
+def total_rows(totals):
+    """Closing rows, one block per mutation: its khata sub-totals (only when no grand total was printed),
+    then its Total."""
+    out = []
+    for mt in totals:
+        t = mt["total"]
+        if t and not mt["kind"].startswith("grand"):
+            for mut, khata, area, page in mt["subs"]:
+                a = _kms(area)
+                if a:
+                    out.append(["", mut, "", "", "", khata, "Sub-total", a[0], a[1], _fmt3(a[2]), page])
+        out.append(["", mt["mut"], "", "", "", "", "Total", *(t[:2] if t else ("", "")), _fmt3(t[2]) if t else "", ""])
+    return out
 
 
 # --------------------------------------------------------------------- run --
@@ -412,9 +437,9 @@ def run(srv, root, models, ask, ask_json, log, redo=False, stop=lambda: False, s
                 xlsx, review, saved = write_outputs(path, res, place, src)
                 if live and saved:
                     live(name, saved, res["pages"], res["pages"])  # as saved, with the total at the end
-                t = res["total"]
-                say(f"  -> {os.path.basename(xlsx) if xlsx else 'no Excel file'}: {len(res['rows'])} khasras, total "
-                    f"{f'{t[0]}-{t[1]}-{_fmt3(t[2])}' if t else 'not found'}, {res['missing']:.0%} missing"
+                tots = ", ".join((f"{mt['mut']}: " if mt["mut"] else "") + fmt_kms(mt["total"]) for mt in res["totals"])
+                say(f"  -> {os.path.basename(xlsx) if xlsx else 'no Excel file'}: {len(res['rows'])} khasras, "
+                    f"total{'s' if len(res['totals']) > 1 else ''} {tots}, {res['missing']:.0%} missing"
                     f"{' - REVIEW MANUALLY note written' if review else ''}, {time.time() - t0:.0f}s")
                 n["review" if review else "done"] += 1
             except Exception as e:

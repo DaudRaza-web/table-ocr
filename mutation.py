@@ -59,7 +59,10 @@ def parse_khasra(text):
     """Column 16 lists khasra numbers like '37/24/1', each with a short number under its bar ('37').
     Return the full khasra numbers in printed order, repeats included (each is a separate entry with
     its own area): '37/24/1, 37/23/2, 47/3/1, 37/23/2'. The under-bar numbers are dropped."""
-    t = re.sub(r"[ \t]*/[ \t]*", "/", _norm(text))  # '56 / 7 / 2' -> '56/7/2', without joining lines
+    # The list ends with "قطعات N" (the number of plots); anything after it - the count, a share like
+    # "1/1" - is not a khasra number.
+    t = re.split(r"قطعا?ت|قطعہ", _norm(text))[0]
+    t = re.sub(r"[ \t]*/[ \t]*", "/", t)  # '56 / 7 / 2' -> '56/7/2', without joining lines
     # Some registers print a khasra with a leading slash ('/69/7'); keep it as printed.
     return ", ".join(re.findall(r"(?<![\d/])/?\d{1,5}(?:/\d{1,5})+(?![\d/])", t))
 
