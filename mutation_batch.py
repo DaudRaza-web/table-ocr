@@ -7,7 +7,7 @@ khasra mode). One row per khasra: Mutation No, Khata Khatuni, Khasra No.; the ar
 per khasra, only the document's total at the end: its grand total (میزان کل) when printed, otherwise
 the khatas' printed sub-totals added up - one total for each mutation number in the document. District / Tehsil / Mouza come from the award document in the
 same folder (its converted Excel file if there is one), not from the mutation. A Word file with the
-same name lists the place, then each khata with its khasras.
+same name lists the place, then per mutation each khata with its khasras and the mutation's total area.
 
 Documents that can't be read, or with more than 30% of their data missing, get a
 "<name> - REVIEW MANUALLY.txt" note next to them. The models are checked every few pages and after any
@@ -279,16 +279,17 @@ def _xml(text):
 
 
 def docx_bytes(paragraphs):
-    """A minimal Word document. paragraphs: [[(text, bold), ...], ...] (an empty list is a blank line).
-    Written directly (three XML parts in a zip) so the tool needs no extra package."""
+    """A minimal Word document. paragraphs: [[(text, bold) or (text, bold, points), ...], ...] (an empty
+    list is a blank line). Written directly (three XML parts in a zip) so the tool needs no extra package."""
     import io
     import zipfile
 
-    def run(text, bold):
-        props = "<w:rPr><w:b/></w:rPr>" if bold else ""
+    def run(text, bold, size=None):
+        props = ("<w:b/>" if bold else "") + (f'<w:sz w:val="{int(size * 2)}"/>' if size else "")
+        props = f"<w:rPr>{props}</w:rPr>" if props else ""
         return f'<w:r>{props}<w:t xml:space="preserve">{_xml(text)}</w:t></w:r>'
 
-    body = "".join(f"<w:p>{''.join(run(t, b) for t, b in p)}</w:p>" for p in paragraphs)
+    body = "".join(f"<w:p>{''.join(run(*r) for r in p)}</w:p>" for p in paragraphs)
     document = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                 '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
                 f'<w:body>{body}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
@@ -312,16 +313,28 @@ def docx_bytes(paragraphs):
     return buf.getvalue()
 
 
-def summary_paragraphs(rows, place):
-    """District / Tehsil / Village, then each khata (in order of first appearance) with its khasras."""
+def area_words(t, unit):
+    """(K, M, S) -> "149 K – 17 M" (with the third figure only when it isn't 0)."""
+    if not t:
+        return "not found"
+    third = f" – {_fmt3(t[2])} {'Sq ft' if unit == 'Sq ft' else 'S'}" if t[2] else ""
+    return f"{t[0]} K – {t[1]} M{third}"
+
+
+def summary_paragraphs(rows, place, totals):
+    """District / Tehsil / Village, then a section per mutation: each khata (in order of first appearance)
+    with its khasras, and the mutation's total area."""
     out = [[("District: ", True), (place.get("district", ""), False)],
            [("Tehsil: ", True), (place.get("tehsil", ""), False)],
            [("Village/Mouza: ", True), (place.get("mouza", ""), False)]]
-    khatas = {}
-    for r in rows:
-        khatas.setdefault(r["khata"] or "(not read)", []).append(r["khasra"])
-    for khata, khasras in khatas.items():
-        out += [[], [(f"Khata Khatuni# {khata}: ", True), (", ".join(khasras), False)]]
+    for mt in totals:
+        khatas = {}
+        for r in rows:
+            if r["mut"] == mt["mut"]:
+                khatas.setdefault(r["khata"] or "(khata not read)", []).append(r["khasra"])
+        out += [[], [(f"Mutation {mt['mut']}" if mt["mut"] else "Mutation", True, 14)], []]
+        out += [[(f"{khata}: ", True), (", ".join(khasras), False)] for khata, khasras in khatas.items()]
+        out += [[("Total Area: " + area_words(mt["total"], mt["unit"]), True)]]
     return out
 
 
@@ -366,7 +379,7 @@ def write_outputs(path, res, place, place_src):
         f.write(award.build_xlsx(rows, info, issues, headers=HEADERS, widths=WIDTHS, text_cols=(1, 5, 6),
                                  title="Mutation Land"))
     with open(re.sub(r"\.xlsx$", ".docx", xlsx), "wb") as f:  # the same land list as a Word summary
-        f.write(docx_bytes(summary_paragraphs(res["rows"], place)))
+        f.write(docx_bytes(summary_paragraphs(res["rows"], place, res["totals"])))
     return xlsx, review, rows
 
 
