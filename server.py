@@ -879,6 +879,8 @@ class Handler(BaseHTTPRequestHandler):
                 names = [m["name"] for m in tags.get("models", [])]
                 return self.send(200, {"ok": True, "models": names, "default": DEFAULT_MODEL,
                                        "translate_default": TRANSLATE_MODEL})
+            if url.path == "/api/version":
+                return self.send(200, {"changed": code_changed()})
             if url.path == "/api/page":
                 doc = self.get_doc(q["id"])
                 with DOCS_LOCK:
@@ -1106,13 +1108,32 @@ def lan_ips():
     return sorted(ip for ip in ips if not ip.startswith(("127.", "169.254.", "172.")))  # skip loopback/WSL/Docker
 
 
+CODE_FILES = [os.path.join(os.path.dirname(os.path.abspath(__file__)), f)
+              for f in ("server.py", "award.py", "award_batch.py", "mutation.py", "mutation_batch.py")]
+CODE_STAMP = {f: os.path.getmtime(f) for f in CODE_FILES if os.path.exists(f)}
+
+
+def code_changed():
+    """Python files edited since this server started (the running tool still uses the old code)."""
+    return [os.path.basename(f) for f, t in CODE_STAMP.items() if os.path.exists(f) and os.path.getmtime(f) != t]
+
+
 def main():
+    url = f"http://127.0.0.1:{PORT}/"
+    try:  # Windows lets a second server share the port, and the old one keeps answering: don't start twice
+        with socket.create_connection(("127.0.0.1", PORT), timeout=1):
+            print(f"Table OCR is already running at {url} - close that window first (or use it).", flush=True)
+            if "--no-browser" not in sys.argv:
+                webbrowser.open(url)
+            return
+    except OSError:
+        pass
+
     def check_ollama():  # in the background, so the tool opens straight away while WSL/Ollama boot
         print(f"Checking Ollama at {OLLAMA} ...", flush=True)
         print("Ollama OK" if ensure_ollama() else "WARNING: Ollama not reachable; extraction will fail until it is up.", flush=True)
     threading.Thread(target=check_ollama, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
-    url = f"http://127.0.0.1:{PORT}/"
     print(f"Table OCR running at {url}  (Ctrl+C to stop)")
     if HOST != "127.0.0.1":
         print("Open from other devices on your network at:")

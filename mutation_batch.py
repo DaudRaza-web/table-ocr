@@ -186,6 +186,7 @@ def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: Fa
         if not res["ok"]:
             failed += 1
             issues.append(f"Page {n + 1}: {res['error']}")
+            log(f"    !! page {n + 1} skipped: {'model error' if res.get('crashed') else 'no register table found (both turns, several tilts tried)'}")
             continue
         for rec in res["records"]:
             mut = rec["award"] or last_mut

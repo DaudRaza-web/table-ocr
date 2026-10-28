@@ -1233,6 +1233,14 @@ let savedTab = 'table';
 try { savedTab = localStorage.getItem('tab') || 'table'; } catch {}
 setTab(['translate', 'mutation', 'award', 'mbatch'].includes(savedTab) ? savedTab : 'table');
 loadModels().catch(e => status(e.message, true));
+// The tool's code edited after it was started: it keeps running the old code until restarted.
+setInterval(async () => {
+  try {
+    const v = await api('/api/version');
+    if (v.changed.length && !AB.running && !MB.running && !A.running && !M.running)
+      status(`The tool was updated (${v.changed.join(', ')}) — close and restart it to use the new version.`, true);
+  } catch {}
+}, 60000);
 </script>
 </body>
 </html>

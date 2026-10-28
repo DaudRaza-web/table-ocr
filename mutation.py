@@ -100,9 +100,9 @@ def format_khata(items):
     return ", ".join(str(a) if b is None or b == a else f"{a} to {b}" for a, b in items)
 
 
-def _dark_rows(pix):
+def _dark_rows(pix, dark=200):
     w, h, s, st = pix.width, pix.height, pix.samples, pix.stride
-    return w, h, [bytes(1 if v < 200 else 0 for v in s[y * st: y * st + w]) for y in range(h)]
+    return w, h, [bytes(1 if v < dark else 0 for v in s[y * st: y * st + w]) for y in range(h)]
 
 
 def _group(idxs, gap=3):
@@ -178,13 +178,14 @@ def pick_columns(xs):
     return best
 
 
-def find_grid(page, rot=0):
-    """Locate the register table on an (upright after `rot`) page.
+def find_grid(page, rot=0, dark=200):
+    """Locate the register table on an (upright after `rot`) page. `dark`: grey level below which a pixel
+    counts as ink (raise it for faint rules).
     Returns {"cols": [(x0, x1) for column 1..17], "rows": [(y0, y1) data bands], "top": y, "size": (w, h)}
     in fractions of the rotated page, or None if no 17-column ruled table is found."""
     z = RENDER_LONG / max(page.rect.width, page.rect.height)
     pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z).prerotate(rot), colorspace=pymupdf.csGRAY, alpha=False)
-    w, h, D = _dark_rows(pix)
+    w, h, D = _dark_rows(pix, dark)
 
     # Horizontal rules: rows that are largely dark. OR-ing a few rows tolerates slight skew; the bar is
     # deliberately low because scanned borders are often faint or broken (a real scan's top border
@@ -255,6 +256,32 @@ def find_grid(page, rot=0):
     span = v[-1] - v[0]
     fit = max(abs((x - v[0]) / span - t) for x, t in zip(v, FORM_RULES)) if span > 0 else 1.0
     return {"cols": cols, "rows": rows, "top": bands[num][0] / h, "size": (w, h), "fit": fit}
+
+
+GRID_FIT = 0.03  # worst deviation from the form's column layout (in table widths) accepted as the register
+
+
+def locate_grid(page, rot):
+    """Find the register grid, letting the grid confirm the set-up rather than trusting one tilt estimate:
+    the estimated tilt first, then nearby angles, then a lighter ink threshold for faint rules. Stops at the
+    first set-up where the 17-column form is found. -> (page to read, rot, grid, skew) or None.
+    (The page returned is a straightened copy when the scan is tilted.)"""
+    est = estimate_skew(page, rot)
+    tries = [(est, 200), (est, 230)] + [(est + d, 200) for d in (-0.5, 0.5, -1.0, 1.0)]
+    if abs(est) >= 0.1:
+        tries.insert(2, (0.0, 200))  # the estimate itself may be the problem
+    near = None  # closest miss, used if nothing fits the form well
+    for skew, dark in tries:
+        pg, r = (straightened(page, rot, skew, longest=3600), 0) if abs(skew) >= 0.1 else (page, rot)
+        try:
+            g = find_grid(pg, r, dark)
+        except Exception:
+            g = None
+        if g and g["fit"] <= GRID_FIT:
+            return pg, r, g, skew
+        if g and g["fit"] <= 0.045 and (near is None or g["fit"] < near[2]["fit"]):
+            near = (pg, r, g, skew)
+    return near
 
 
 def orientation_from_grid(page):
@@ -373,10 +400,10 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
      confidence, notes, cells}], "grid": {...}} — cells/grid (fractions) let the UI outline what was read."""
     lock = lock or contextlib.nullcontext()
     with lock:
-        skew = estimate_skew(page, rot)
-        if abs(skew) >= 0.1:  # tilted scan: read from an upright, de-tilted copy
-            page, rot = straightened(page, rot, skew, longest=3600), 0
-        grid = find_grid(page, rot)
+        found = locate_grid(page, rot)  # tilted scans are read from an upright, de-tilted copy
+    grid = skew = None
+    if found:
+        page, rot, grid, skew = found
     if not grid:
         return {"ok": False, "records": [], "error": "Couldn't find the 17-column register table on this page. "
                 "If it is sideways, rotate it upright first; if it isn't a Register Dakhil Kharij page, type the entry in by hand."}
