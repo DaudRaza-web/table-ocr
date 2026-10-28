@@ -38,7 +38,9 @@
   #tableWrap { flex: 1; overflow: auto; padding: 12px; }
   #title { width: 100%; font-size: 18px; font-weight: 600; text-align: center; margin-bottom: 10px; }
   .gridbox { position: relative; outline: none; width: fit-content; min-width: 100%; }
-  #mWrap { flex: 1; overflow: auto; padding: 12px; }
+  #mWrap, #aWrap { flex: 1; overflow: auto; padding: 12px; }
+  .sheet td.tot { font-weight: 700; }
+  #aIssues { max-height: calc(5 * 1.45em + 4px); line-height: 1.45; overflow-y: auto; padding-right: 6px; }
   .mbatch input[type=text] { width: 9.5em; }
   .sheet th.named { white-space: nowrap; color: var(--ink); font-weight: 600; font-size: 12px; padding: 4px 8px; }
   .sheet td.sno { color: var(--muted); text-align: right; }
@@ -107,12 +109,13 @@
     <button role="tab" data-tab="table" class="active">Table → Excel</button>
     <button role="tab" data-tab="translate">Translate</button>
     <button role="tab" data-tab="mutation">Mutation register</button>
+    <button role="tab" data-tab="award">Award</button>
   </nav>
   <button class="primary" id="openBtn">Open image / PDF</button>
   <input type="file" id="file" accept=".pdf,image/*" hidden>
   <span id="fname" style="color:var(--muted)"></span>
   <span class="spacer"></span>
-  <label style="color:var(--muted)" class="for-table for-mutation">Model <select id="model"></select></label>
+  <label style="color:var(--muted)" class="for-table for-mutation for-award">Model <select id="model"></select></label>
   <label style="color:var(--muted)" class="for-translate" hidden>Model <select id="tModel"></select></label>
   <span id="spinner"></span>
   <span id="status">Starting…</span>
@@ -145,10 +148,14 @@
       <button class="for-mutation" id="mReadAll" disabled hidden>Read all pages</button>
       <button class="for-mutation" id="mStop" hidden>Stop</button>
       <span class="for-mutation muted" id="mProgress" hidden></span>
+      <button class="primary for-award" id="aRead" disabled hidden>Read award</button>
+      <button class="for-award" id="aStop" hidden>Stop</button>
+      <span class="for-award muted" id="aProgress" hidden></span>
       <button id="clearSel" disabled>Clear selection</button>
     </div>
     <div class="hint for-table">Drag over the page to select the table region.</div>
     <div class="hint for-mutation" hidden>Open Register Dakhil Kharij pages (PDF or images). Each page's columns 1, 2, 14 and 17 are found and read by the local model; the cells it read are outlined on the page.</div>
+    <div class="hint for-award" hidden>Open an award PDF and press Read award. The land table (Sqr. No / Khasra No. / K / M) is read page by page until its total; the square number is carried down and joined to each khasra.</div>
     <div class="hint for-translate" hidden>Drag over the page to select text. It is transcribed into “Original text” (fix any errors there), then translated. A paragraph or column at a time works best.</div>
     <div id="viewer">
       <div id="empty">Open or drop an image / PDF to begin.</div>
@@ -216,6 +223,32 @@
     </div>
   </section>
 
+  <section class="pane for-award" id="awardPane" hidden>
+    <div class="bar mbatch">
+      <label>Award No <input type="text" id="aAward" placeholder="e.g. 2/2015" style="width:7em"></label>
+      <label>District <input type="text" id="aDistrict"></label>
+      <label>Tehsil <input type="text" id="aTehsil"></label>
+      <label>Locality/Mouza <input type="text" id="aMouza"></label>
+    </div>
+    <div class="hint" style="padding-top:8px">These are read from the award and go on every row — editing one here changes all rows. Only the document's total K-M is shown; individual areas are left blank.</div>
+    <div class="bar">
+      <span class="grp">
+        <button id="aUndo" title="Undo (Ctrl+Z)">↶</button>
+        <button id="aRedo" title="Redo (Ctrl+Y)">↷</button>
+      </span>
+      <button id="aAddRow" title="Insert a row below the selection">+ Row</button>
+      <button id="aDelRow" title="Delete the selected rows">− Row</button>
+      <button id="aClear" title="Remove all rows">Clear all</button>
+      <span class="spacer"></span>
+      <button id="aCopy" title="Copy the table with headers (paste into Excel at A1)">Copy rows</button>
+      <button class="primary" id="aExport">Download Excel</button>
+    </div>
+    <div id="aWrap">
+      <div id="aGridBox" class="gridbox"></div>
+      <ul id="aIssues" class="issues"></ul>
+    </div>
+  </section>
+
   <section class="pane for-table" id="tablePane">
     <div class="bar">
       <span class="grp">
@@ -251,6 +284,7 @@ const $ = s => document.querySelector(s);
 const state = { doc: null, pages: 0, page: 0, zoom: 1, natW: 0, sel: null, busy: false, tab: 'table', rot: {}, shownRot: 0 };
 let grid = null;  // table editor (grid.js); holds the table data
 let mGrid = null; // mutation register table (fixed headers)
+let aGrid = null; // award land table (fixed headers)
 const M = { flags: new Map(), notes: [], emptyPages: new Set(), khataTotals: new Map(), alts: new Map(), cells: {}, running: false, halt: false, sinceCheck: 0 };  // flags: "award|khata" -> {col: note}
 
 function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
@@ -291,7 +325,7 @@ async function loadModels() {
 function setTab(tab) {
   state.tab = tab;
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  document.querySelectorAll('.for-table, .for-translate, .for-mutation').forEach(el => el.hidden = !el.classList.contains('for-' + tab));
+  document.querySelectorAll('.for-table, .for-translate, .for-mutation, .for-award').forEach(el => el.hidden = !el.classList.contains('for-' + tab));
   try { localStorage.setItem('tab', tab); } catch {}
   refreshButtons();
 }
@@ -311,6 +345,8 @@ async function openFile(f) {
     if (hadRows) mGrid.clear();
     M.flags.clear(); M.notes = []; M.emptyPages.clear(); M.khataTotals.clear(); M.alts.clear(); M.cells = {}; M.sinceCheck = 0;
     mChanged();
+    if (aGrid.hasData()) aGrid.clear();
+    A.notes = []; A.pages = []; aChanged();
     api('/api/models/unload', { method: 'POST', body: JSON.stringify({ models: [$('#model').value, $('#tModel').value].filter(Boolean) }) }).catch(() => {});
     $('#fname').textContent = f.name;
     $('#pageCount').textContent = j.pages;
@@ -329,7 +365,8 @@ async function showPage(n, fit = false) {
   const token = state.showToken = (state.showToken || 0) + 1;
   if ($('#autoRot').checked && state.rot[n] === undefined) {
     try {
-      const j = await api(`/api/orient?id=${state.doc}&n=${n}`);
+      // award pages are portrait documents: don't apply the landscape-register rules to them
+      const j = await api(`/api/orient?id=${state.doc}&n=${n}${state.tab === 'award' ? '&form=page' : ''}`);
       state.rot[n] = j.rotation;
       if (j.rotation) status(`Page ${n + 1} auto-rotated ${j.rotation}°${j.method === 'guess' ? ' (direction is a guess — use ⟲ ⟳ if it is upside down)' : ''}.`);
       else if (j.method === 'unknown') status(`Page ${n + 1}: couldn't tell which way up it is — use ⟲ ⟳ if it's turned.`);
@@ -847,8 +884,134 @@ $('#mCopy').onclick = async () => {
   try { await navigator.clipboard.writeText(text); status('Copied. Paste into Excel at cell A1.'); } catch { status('Clipboard not available — use Download Excel.', true); }
 };
 
+/* ---------- award ---------- */
+// Land table of an award document: each page's table is read by the table extractor (see award.py), the
+// server builds the khasra list (square carried down and joined to the khasra), and only the document's
+// total K-M is shown, on the closing Total row.
+const A_HEAD = ['S.No.', 'Award No', 'District', 'Tehsil', 'Locality/Mouza', 'Khasra No.', 'K', 'M', 'Page'];
+const A = { notes: [], pages: [], used: [], running: false, halt: false };
+const A_FIELDS = [['aAward', 1], ['aDistrict', 2], ['aTehsil', 3], ['aMouza', 4]];
+const isTotalRow = row => String(row[5]).trim().toLowerCase() === 'total';
+aGrid = createGrid({
+  box: $('#aGridBox'), colNames: A_HEAD, hasHeader: () => false, status: (m, err) => status(m, err),
+  onChange: () => aChanged(),
+  cellClass: (r, c, row) => {
+    if (isTotalRow(row)) return (c === 6 || c === 7) && !isInt(row[c]) ? 'warn' : 'tot';
+    if (c === 0) return 'sno';
+    if (c === 5 && !/^\d+(\/\d+)*$/.test(String(row[5]).trim())) return 'warn';
+    return c >= 1 && c <= 4 ? 'loc' : '';
+  },
+});
+function aIssues() {
+  const out = [...A.notes];
+  aGrid.rows.forEach((row, i) => {
+    if (isTotalRow(row)) { if (!isInt(row[6]) || !isInt(row[7])) out.push('The total K-M was not found — type it into the Total row.'); return; }
+    if (!/^\d+(\/\d+)*$/.test(String(row[5]).trim())) out.push(`S.No. ${i + 1}${row[8] ? ` (page ${row[8]})` : ''}: khasra number "${row[5]}" looks wrong`);
+  });
+  if (aGrid.hasData() && !aGrid.rows.some(isTotalRow)) out.push('There is no Total row.');
+  return out;
+}
+function aChanged() {
+  aGrid.renumber(0, isTotalRow);  // S.No. counts the land rows only
+  const ul = $('#aIssues'); ul.innerHTML = '';
+  aIssues().forEach(t => { const li = document.createElement('li'); li.textContent = t; ul.append(li); });
+  refreshButtons();
+}
+A_FIELDS.forEach(([id, col]) => $('#' + id).addEventListener('change', () => {
+  const v = $('#' + id).value.trim();
+  if (aGrid.hasData()) aGrid.setData(aGrid.rows.map(r => isTotalRow(r) ? r : r.map((x, c) => c === col ? v : x)));
+}));
+function aFill(res) {  // build result -> table (one undoable step)
+  const f = Object.fromEntries(A_FIELDS.map(([id, col]) => [col, $('#' + id).value.trim()]));
+  const rows = res.rows.map((r, i) => [String(i + 1), f[1], f[2], f[3], f[4], r.khasra, '', '', String(r.page)]);
+  const [k, m] = res.total || ['', ''];
+  aGrid.setData([...rows, ['', '', '', '', '', 'Total', String(k), String(m), '']]);
+}
+async function aRead() {
+  if (!state.doc || A.running) return;
+  A.running = true; A.halt = false; A.pages = []; A.used = []; A.notes = []; refreshButtons();
+  const model = $('#model').value, name = $('#fname').textContent;
+  let res = null;
+  A.head = [];
+  if ($('#autoRot').checked) state.rot = {};  // turns detected on another tab used the register rules
+  try {
+    for (let n = 0; n < state.pages && !A.halt; n++) {
+      await showPage(n);
+      $('#aProgress').textContent = `Page ${n + 1} of ${state.pages}…`;
+      status(`Reading page ${n + 1}… (the first page loads the model)`);
+      const j = await api('/api/award/read', { method: 'POST', body: JSON.stringify({ id: state.doc, page: n, rot: rotOf(n), model }) });
+      A.pages.push([n + 1, j.cells]);
+      res = await api('/api/award/build', { method: 'POST', body: JSON.stringify({ id: state.doc, name, pages: A.pages }) });
+      const here = res.rows.some(r => r.page === n + 1) || res.total;
+      if (!here) {
+        if (A.used.length) { A.notes.push(`Page ${n + 1}: no land table here although the total was not reached yet.`); break; }
+        continue;  // the land table has not started
+      }
+      A.used.push(n + 1);
+      if (A.used.length === 1) {  // first page of the table: award number and place names
+        $('#aAward').value = res.award || '';
+        const p = (await api('/api/award/place', { method: 'POST', body: JSON.stringify({ id: state.doc, page: n, rot: rotOf(n), model }) })).place || {};
+        $('#aDistrict').value = p.district || ''; $('#aTehsil').value = p.tehsil || ''; $('#aMouza').value = p.mouza || '';
+        if (!res.award) A.notes.push('Award number not found in the file name or page header — type it in above.');
+        [['district', 'District'], ['tehsil', 'Tehsil'], ['mouza', 'Locality/Mouza']].forEach(([k, lab]) => { if (!p[k]) A.notes.push(`${lab} could not be read — type it in above.`); });
+        A.head = A.notes.slice();
+      }
+      aFill(res);
+      A.notes = [...A.head, ...res.issues];
+      aChanged();
+      if (res.total) break;  // the total closes the land table
+    }
+    if (!A.used.length) A.notes.push('No land table (Sqr. No / Khasra No. / K / M) was found.');
+    aChanged();
+    status(A.halt ? 'Stopped.' : `Done: ${res ? res.rows.length : 0} khasras${res && res.total ? `, total ${res.total[0]} K - ${res.total[1]} M` : ', no total found'}. Check the table against the pages.`);
+  } catch (e) { status(e.message, true); }
+  A.running = false; $('#aProgress').textContent = ''; refreshButtons();
+}
+$('#aRead').onclick = aRead;
+$('#aStop').onclick = () => { A.halt = true; status('Stopping after the current page…'); };
+const aKeep = fn => () => { fn(); $('#aGridBox').focus({ preventScroll: true }); };
+$('#aUndo').onclick = aKeep(() => aGrid.undo());
+$('#aRedo').onclick = aKeep(() => aGrid.redo());
+$('#aAddRow').onclick = aKeep(() => {
+  if (!aGrid.hasData()) aFill({ rows: [{ khasra: '', page: '' }], total: null });
+  else { aGrid.insertRowsBelow(); const x = aGrid.selection; aGrid.select([x.r1 + 1, 5]); }
+});
+$('#aDelRow').onclick = aKeep(() => aGrid.deleteRows());
+let aClearArmed = false;
+$('#aClear').onclick = e => {
+  if (!aClearArmed) { aClearArmed = true; e.target.textContent = 'Click again to clear'; setTimeout(() => { aClearArmed = false; e.target.textContent = 'Clear all'; }, 3000); return; }
+  aClearArmed = false; e.target.textContent = 'Clear all';
+  aGrid.clear(); A.notes = []; aChanged(); status('Cleared (Ctrl+Z in the table brings the rows back).');
+};
+$('#aExport').onclick = async () => {
+  const tot = aGrid.rows.find(isTotalRow) || [];
+  const info = [['Source file', $('#fname').textContent], ['Pages with the land table', A.used.join(', ') || '—'],
+                ['Khasras listed', aGrid.rows.filter(r => !isTotalRow(r)).length],
+                ['Total (from the document)', isInt(tot[6]) ? `${tot[6]} K - ${tot[7] || 0} M` : 'not found'],
+                ['Extracted', new Date().toLocaleString()]];
+  const filename = ['Award', $('#aAward').value.trim().replace(/\//g, '-'), $('#aMouza').value.trim(), '- Land'].filter(Boolean).join(' ');
+  try {
+    const r = await api('/api/award/export', { method: 'POST', body: JSON.stringify({ rows: aGrid.rows, info, issues: aIssues(), filename }) });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(await r.blob()); a.download = filename + '.xlsx';
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    status('Saved ' + a.download);
+  } catch (e) { status(e.message, true); }
+};
+$('#aCopy').onclick = async () => {
+  try { await navigator.clipboard.writeText([A_HEAD, ...aGrid.rows].map(r => r.join('\t')).join('\n')); status('Copied. Paste into Excel at cell A1.'); }
+  catch { status('Clipboard not available — use Download Excel.', true); }
+};
+
 function refreshButtons() {
   const has = !!state.doc;
+  if (aGrid) {
+    $('#aRead').disabled = !has || A.running || state.busy || M.running;
+    $('#aStop').hidden = !A.running || state.tab !== 'award';
+    $('#aProgress').hidden = !A.running || state.tab !== 'award';
+    for (const id of ['aExport', 'aCopy', 'aDelRow', 'aClear']) $('#' + id).disabled = !aGrid.hasData() || A.running;
+    $('#aUndo').disabled = !aGrid.canUndo(); $('#aRedo').disabled = !aGrid.canRedo();
+  }
   if (mGrid) {
     $('#mReadPage').disabled = !has || M.running || state.busy;
     $('#mReadAll').disabled = !has || M.running || state.busy;
@@ -871,7 +1034,7 @@ function refreshButtons() {
 window.addEventListener('resize', drawSel);
 let savedTab = 'table';
 try { savedTab = localStorage.getItem('tab') || 'table'; } catch {}
-setTab(['translate', 'mutation'].includes(savedTab) ? savedTab : 'table');
+setTab(['translate', 'mutation', 'award'].includes(savedTab) ? savedTab : 'table');
 loadModels().catch(e => status(e.message, true));
 </script>
 </body>

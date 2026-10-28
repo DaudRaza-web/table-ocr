@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import pymupdf
 
+import award
 import mutation
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -407,14 +408,16 @@ def orientation_from_tesseract(pngs):
     return best[0] if best and best[1] >= 0.5 else None
 
 
-def detect_orientation(doc, page_no):
-    """-> (clockwise turn that makes the page upright, how it was decided)."""
+def detect_orientation(doc, page_no, register=True):
+    """-> (clockwise turn that makes the page upright, how it was decided).
+    `register`: the page may be a (landscape) mutation register form; False for other documents (awards,
+    letters), where only the text decides and a page is never turned by its shape alone."""
     with DOCS_LOCK:  # MuPDF isn't thread-safe; Tesseract runs outside the lock
         page = doc[page_no]
         rot = orientation_from_text(page)
         if rot is not None:
             return rot, "text"
-        rot = mutation.orientation_from_grid(page)  # register pages: the form's own grid says which way up
+        rot = mutation.orientation_from_grid(page) if register else None  # the form's own grid says which way up
         if rot is not None:
             return rot, "grid"
         pngs = []
@@ -423,6 +426,8 @@ def detect_orientation(doc, page_no):
             pngs.append(page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csGRAY, alpha=False).tobytes("png"))
         portrait = page.rect.height > page.rect.width
     rot = orientation_from_tesseract(pngs)
+    if not register:
+        return (rot, "tesseract") if rot is not None else (0, "unknown")
     if rot is not None and (rot in (90, 270)) == portrait:
         # A register page is a landscape form: portrait scans are on their side, landscape ones are
         # upright or upside down. A Tesseract answer that contradicts the page shape is a misread.
@@ -741,7 +746,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, png, "image/png")
             if url.path == "/api/orient":
                 doc = self.get_doc(q["id"])
-                rot, how = detect_orientation(doc, int(q["n"]))
+                rot, how = detect_orientation(doc, int(q["n"]), register=q.get("form") != "page")
                 return self.send(200, {"rotation": rot, "method": how})
             self.send(404, {"error": "not found"})
         except Exception as e:
@@ -843,6 +848,54 @@ class Handler(BaseHTTPRequestHandler):
                                            req.get("plot", "katat"))
                 return self.send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                  {"Content-Disposition": 'attachment; filename="mutation-register.xlsx"'})
+
+            if url.path in ("/api/award/read", "/api/award/place"):
+                # One award page: the land table's cells via the table extractor (or the place names
+                # above it). The table itself is built from all pages by /api/award/build.
+                req = json.loads(self.body())
+                doc = self.get_doc(req["id"])
+                model = req.get("model") or DEFAULT_MODEL
+                keep_wsl_alive()
+
+                def chat(prompt, png, schema):
+                    body = {"model": model, "stream": False, "format": schema, "keep_alive": "30m",
+                            "options": {"temperature": 0, "num_ctx": 16384, "num_predict": 8192},
+                            "messages": [{"role": "user", "content": prompt, "images": [base64.b64encode(png).decode()]}]}
+                    for attempt in range(3):
+                        try:
+                            return ollama_request("/api/chat", body, timeout=900).get("message", {}).get("content", "")
+                        except (OSError, http.client.HTTPException):
+                            if attempt == 2:
+                                raise
+                            time.sleep(2)
+                            if not ollama_up():
+                                ensure_ollama()
+
+                t0 = time.time()
+                with DOCS_LOCK:
+                    page = doc[int(req["page"])]
+                rot = norm_rot(req.get("rot"))
+                if url.path == "/api/award/place":
+                    return self.send(200, {"place": award.read_place(page, chat, rot)})
+                cells = award.read_table(page, lambda png: parse_rows(chat(PROMPT, png, SCHEMA)), rot)
+                return self.send(200, {"found": cells is not None, "cells": cells or [],
+                                       "seconds": round(time.time() - t0, 1)})
+
+            if url.path == "/api/award/build":
+                req = json.loads(self.body())
+                res = award.build([(int(n), cells) for n, cells in req.get("pages", [])])
+                doc = DOCS.get(req.get("id"))
+                cmd = tesseract_cmd() if doc is not None else None
+                with DOCS_LOCK:
+                    res["award"] = award.award_number(req.get("name", ""), doc[0] if doc is not None else None, cmd)
+                return self.send(200, res)
+
+            if url.path == "/api/award/export":
+                req = json.loads(self.body())
+                data = award.build_xlsx(req.get("rows", []), req.get("info", []), req.get("issues", []))
+                fname = re.sub(r'[\\/:*?"<>|]+', "-", req.get("filename") or "award-land").strip() + ".xlsx"
+                return self.send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 {"Content-Disposition": f'attachment; filename="{fname}"'})
 
             if url.path == "/api/export":
                 req = json.loads(self.body())

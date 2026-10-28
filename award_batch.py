@@ -25,9 +25,6 @@ import award  # noqa: E402
 import server  # noqa: E402
 sys.argv = _argv
 
-from openpyxl import Workbook  # noqa: E402
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side  # noqa: E402
-
 MODEL = server.DEFAULT_MODEL
 DEFAULT_ROOT = r"D:\Danish Enterprises\Motorway\M3 Data"
 PICK_TIMEOUT = 5 * 60
@@ -121,58 +118,16 @@ def pick_award(folder, files):
 
 # ------------------------------------------------------------------- excel --
 
-HEADERS = ["S.No.", "Award No", "District", "Tehsil", "Locality/Mouza", "Khasra No.", "K", "M", "Page"]
-
-
 def write_xlsx(path, src, res, how):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Award Land"
-    thin = Side(style="thin", color="999999")
-    box = Border(left=thin, right=thin, top=thin, bottom=thin)
-    head = PatternFill("solid", fgColor="DDE6F0")
-    ws.append(HEADERS)
-    for c in ws[1]:
-        c.font, c.fill, c.border = Font(bold=True), head, box
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    p = res["place"]
-    for i, r in enumerate(res["rows"], 1):
-        ws.append([i, res["award"], p.get("district", ""), p.get("tehsil", ""), p.get("mouza", ""),
-                   r["khasra"], None, None, r["page"]])
-    k, m = res["total"] or (None, None)
-    ws.append(["", "", "", "", "", "Total", k, m, ""])
-    for row in ws.iter_rows(min_row=2):
-        for c in row:
-            c.border = box
-            c.alignment = Alignment(horizontal="center")
-    for c in ws[ws.max_row]:
-        c.font = Font(bold=True)
-    for col, wdt in zip("ABCDEFGHI", (7, 11, 16, 16, 20, 14, 7, 7, 7)):
-        ws.column_dimensions[col].width = wdt
-    ws.freeze_panes = "A2"
-
-    rv = wb.create_sheet("Review")
-    rv.append(["Item", "Detail"])
-    for c in rv[1]:
-        c.font, c.fill = Font(bold=True), head
-    rv.append(["Source file", src])
-    rv.append(["Award chosen", how])
-    rv.append(["Pages with the land table", ", ".join(map(str, res["pages"])) or "none"])
-    rv.append(["Khasras listed", len(res["rows"])])
-    rv.append(["Total (from the document)", f"{k} K - {m} M" if res["total"] else "not found"])
-    rv.append(["Extracted", datetime.datetime.now().strftime("%Y-%m-%d %H:%M")])
-    rv.append([])
-    rv.append(["Check", "Issue"])
-    for c in rv[rv.max_row]:
-        c.font = Font(bold=True)
-    issues = res["issues"]
-    for it in issues or ["Nothing looked off in the extraction"]:
-        rv.append(["!" if issues else "OK", it])
-    rv.column_dimensions["A"].width = 26
-    rv.column_dimensions["B"].width = 110
-    if issues:
-        rv.sheet_properties.tabColor = "E0A030"  # draws the eye to the Review tab
-    wb.save(path)
+    total = res["total"]
+    info = [("Source file", src), ("Award chosen", how),
+            ("Pages with the land table", ", ".join(map(str, res["pages"])) or "none"),
+            ("Khasras listed", len(res["rows"])),
+            ("Total (from the document)", f"{total[0]} K - {total[1]} M" if total else "not found"),
+            ("Extracted", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))]
+    rows = award.table_rows(res["award"], res["place"], res["rows"], total)
+    with open(path, "wb") as f:
+        f.write(award.build_xlsx(rows, info, res["issues"]))
 
 
 def out_name(res):

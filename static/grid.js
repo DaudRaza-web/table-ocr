@@ -476,9 +476,12 @@ function createGrid({ box, onChange, status, hasHeader, colNames = null, cellCla
     },
     ensureTable() { if (!nR()) { rows = blank(fixedCols ? 1 : 3, fixedCols ? colNames.length : 3); render(); changed(); } },
     // Keep a running number in column `c` (e.g. S.No.). Not an undoable edit; re-renders only if needed.
-    renumber(c) {
-      let dirty = false;
-      rows.forEach((row, i) => { if (row[c] !== String(i + 1)) { row[c] = String(i + 1); dirty = true; } });
+    renumber(c, skip = null) {  // skip(row): rows left unnumbered (and not counted), e.g. a totals row
+      let dirty = false, n = 0;
+      rows.forEach(row => {
+        const v = skip && skip(row) ? '' : String(++n);
+        if (row[c] !== v) { row[c] = v; dirty = true; }
+      });
       if (dirty) render();
     },
     clear() { if (nR()) record(); rows = []; merges = []; render(); changed(); },

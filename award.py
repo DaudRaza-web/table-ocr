@@ -281,3 +281,71 @@ def extract(path, ask_table, ask_json, cmd=None, max_pages=None, progress=None):
         issues.append("Award number not found in the file name or the page header")
     return {"award": award, "place": place, "rows": res["rows"], "total": res["total"], "issues": issues,
             "pages": used}
+
+
+# ------------------------------------------------------------------- excel --
+
+HEADERS = ["S.No.", "Award No", "District", "Tehsil", "Locality/Mouza", "Khasra No.", "K", "M", "Page"]
+
+
+def table_rows(award, place, rows, total):
+    """Rows of the land table under HEADERS; the K and M columns stay blank except on the closing Total row."""
+    out = [[i, award, place.get("district", ""), place.get("tehsil", ""), place.get("mouza", ""), r["khasra"], "", "",
+            r["page"]] for i, r in enumerate(rows, 1)]
+    k, m = total or ("", "")
+    return out + [["", "", "", "", "", "Total", k, m, ""]]
+
+
+def build_xlsx(rows, info, issues):
+    """rows: table_rows() (possibly edited); info: [(item, detail)] for the Review sheet; issues: [text].
+    -> .xlsx bytes"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    def num(v):
+        s = str(v if v is not None else "").strip()
+        return int(s) if re.fullmatch(r"\d{1,6}", s) else s
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Award Land"
+    thin = Side(style="thin", color="999999")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head = PatternFill("solid", fgColor="DDE6F0")
+    ws.append(HEADERS)
+    for c in ws[1]:
+        c.font, c.fill, c.border = Font(bold=True), head, box
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for r in rows:
+        r = list(r) + [""] * (len(HEADERS) - len(r))
+        # khasra numbers stay text ("2/19/1"); S.No., K, M and Page are numbers
+        ws.append([num(r[0]), r[1], r[2], r[3], r[4], str(r[5]), num(r[6]), num(r[7]), num(r[8])])
+        bold = str(r[5]).strip().lower() == "total"
+        for c in ws[ws.max_row]:
+            c.border = box
+            c.alignment = Alignment(horizontal="center")
+            if bold:
+                c.font = Font(bold=True)
+    for col, wdt in zip("ABCDEFGHI", (7, 11, 16, 16, 20, 14, 7, 7, 7)):
+        ws.column_dimensions[col].width = wdt
+    ws.freeze_panes = "A2"
+
+    rv = wb.create_sheet("Review")
+    rv.append(["Item", "Detail"])
+    for c in rv[1]:
+        c.font, c.fill = Font(bold=True), head
+    for item in info:
+        rv.append(list(item))
+    rv.append([])
+    rv.append(["Check", "Issue"])
+    for c in rv[rv.max_row]:
+        c.font = Font(bold=True)
+    for it in issues or ["Nothing looked off in the extraction"]:
+        rv.append(["!" if issues else "OK", it])
+    rv.column_dimensions["A"].width = 26
+    rv.column_dimensions["B"].width = 110
+    if issues:
+        rv.sheet_properties.tabColor = "E0A030"  # draws the eye to the Review tab
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
