@@ -354,10 +354,12 @@ def build_khata(numbers, layout):
     return items, True
 
 
-def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="katat"):
+def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="katat", keep_totals=False):
     """plot_field: "katat" = the small number under the column 17 total (some registers);
     "khasra" = the khasra numbers listed in column 16 (registers that list khasra numbers instead).
-    The value is returned in the record's "katat" key either way, with the flag "katat"."""
+    The value is returned in the record's "katat" key either way, with the flag "katat".
+    keep_totals (khasra mode): also return rows that only carry a column 17 area, such as the
+    document's grand total (میزان کل), with "total_only": True."""
     """Read every mutation entry on one register page.
     `ask(model, prompt, png) -> str` calls the local vision model. `lock` (optional) is held while
     rendering — MuPDF isn't thread-safe — but not during the slow model calls. Returns a dict:
@@ -465,21 +467,23 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
             if not katat:
                 notes.append("katat under the column 17 total could not be read"); flags.append("katat"); conf = "low"
         continuation = not inked[14] and not inked[17]
-        khasra_only = False
+        khasra_only = total_only = False
         if not khata and not (kanal or marla or sarsai):
             # Only more owners for the award, or a summary page (totals, share-transferred box) with no
             # khata and no column-14 area: nothing to put in the table — unless it lists khasra numbers
             # (khasra mode), which the caller adds if they aren't in the table yet.
             if not (plot_field == "khasra" and katat):
-                continue
-            khasra_only = True  # keep only the khasra/area notes; khata and area are blank by design here
+                if not (keep_totals and col17_total):
+                    continue
+                total_only = True
+            khasra_only = not total_only  # keep only the khasra/area notes; khata and area are blank by design here
             keep = [i for i, f in enumerate(flags) if f in ("katat", "khasra_area")]
             notes = [n for n in notes if n.startswith(("khasra", "column 16", "column 17"))]
             flags = [flags[i] for i in keep]
             conf = "medium" if flags else "high"
         records.append({"award": award, "khata": khata, "katat": katat, "kanal": kanal, "marla": marla,
                         "sarsai": sarsai, "continuation": continuation, "confidence": conf, "notes": "; ".join(notes),
-                        "flags": flags, "khasra_only": khasra_only,
+                        "flags": flags, "khasra_only": khasra_only, "total_only": total_only,
                         "khasra_items": khasra_items, "col17_total": col17_total,
                         "cells": {str(c): r for c, r in cells.items()}})  # the cells read, for outlining
     return {"ok": True, "records": records, "error": "", "grid": grid, "skew": round(skew, 2), "location": location}

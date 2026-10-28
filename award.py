@@ -416,9 +416,11 @@ def combined_rows(comb):
     return out
 
 
-def build_xlsx(rows, info, issues):
+def build_xlsx(rows, info, issues, headers=HEADERS, widths=(7, 11, 16, 16, 20, 14, 7, 7, 7), text_cols=(1, 5),
+               title="Award Land"):
     """rows: table_rows() (possibly edited); info: [(item, detail)] for the Review sheet; issues: [text].
-    -> .xlsx bytes"""
+    text_cols: columns kept as text (numbers like khasras); a row whose khasra column (the last text
+    column) holds words - Total, Sub-total - is bold. -> .xlsx bytes"""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
@@ -428,26 +430,28 @@ def build_xlsx(rows, info, issues):
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "Award Land"
+    ws.title = title
     thin = Side(style="thin", color="999999")
     box = Border(left=thin, right=thin, top=thin, bottom=thin)
     head = PatternFill("solid", fgColor="DDE6F0")
-    ws.append(HEADERS)
+    ws.append(list(headers))
     for c in ws[1]:
         c.font, c.fill, c.border = Font(bold=True), head, box
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    label = max(text_cols)
     for r in rows:
-        r = list(r) + [""] * (len(HEADERS) - len(r))
-        # khasra numbers stay text ("2/19/1"); S.No., K, M and Page are numbers
-        ws.append([num(r[0]), r[1], r[2], r[3], r[4], str(r[5]), num(r[6]), num(r[7]), num(r[8])])
-        bold = bool(re.search(r"[A-Za-z]", str(r[5])))  # Total / Award total / Less rows
+        r = list(r) + [""] * (len(headers) - len(r))
+        # khasra numbers stay text ("2/19/1"); S.No., areas and Page are numbers
+        ws.append([str(v if v is not None else "") if i in text_cols else num(v) for i, v in enumerate(r)])
+        bold = bool(re.search(r"[A-Za-z]", str(r[label])))  # Total / Sub-total / Award total / Less rows
         for c in ws[ws.max_row]:
             c.border = box
             c.alignment = Alignment(horizontal="center")
             if bold:
                 c.font = Font(bold=True)
-    for col, wdt in zip("ABCDEFGHI", (7, 11, 16, 16, 20, 14, 7, 7, 7)):
-        ws.column_dimensions[col].width = wdt
+    from openpyxl.utils import get_column_letter
+    for i, wdt in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = wdt
     ws.freeze_panes = "A2"
 
     rv = wb.create_sheet("Review")

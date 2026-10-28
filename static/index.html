@@ -40,6 +40,10 @@
   .gridbox { position: relative; outline: none; width: fit-content; min-width: 100%; }
   #mWrap, #aWrap { flex: 1; overflow: auto; padding: 12px; }
   .sheet td.tot { font-weight: 700; }
+  #mbWrap { flex: 1; overflow: auto; padding: 12px; }
+  #mbTable td, #mbTable th { padding: 3px 8px; text-align: center; white-space: nowrap; }
+  #mbTable tr.tot td { font-weight: 700; }
+  #mbLog { max-height: 12em; overflow: auto; font-size: 12px; line-height: 1.35; background: color-mix(in srgb, var(--muted) 10%, transparent); padding: 6px 8px; border-radius: 6px; white-space: pre-wrap; margin: 0; }
   #aLog { margin: 6px 12px 0; max-height: 9.5em; overflow: auto; font-size: 12px; line-height: 1.35; background: color-mix(in srgb, var(--muted) 10%, transparent); padding: 6px 8px; border-radius: 6px; white-space: pre-wrap; }
   #aAsk { max-width: 560px; border: 1px solid var(--line); border-radius: 10px; padding: 16px; background: var(--panel); color: var(--ink); }
   #aAsk label { display: block; padding: 3px 0; font-size: 13px; }
@@ -113,12 +117,13 @@
     <button role="tab" data-tab="translate">Translate</button>
     <button role="tab" data-tab="mutation">Mutation register</button>
     <button role="tab" data-tab="award">Award</button>
+    <button role="tab" data-tab="mbatch">Mutation batch</button>
   </nav>
   <button class="primary" id="openBtn">Open image / PDF</button>
   <input type="file" id="file" accept=".pdf,image/*" hidden>
   <span id="fname" style="color:var(--muted)"></span>
   <span class="spacer"></span>
-  <label style="color:var(--muted)" class="for-table for-mutation for-award">Model <select id="model"></select></label>
+  <label style="color:var(--muted)" class="for-table for-mutation for-award for-mbatch">Model <select id="model"></select></label>
   <label style="color:var(--muted)" class="for-translate" hidden>Model <select id="tModel"></select></label>
   <span id="spinner"></span>
   <span id="status">Starting…</span>
@@ -158,6 +163,7 @@
     </div>
     <div class="hint for-table">Drag over the page to select the table region.</div>
     <div class="hint for-mutation" hidden>Open Register Dakhil Kharij pages (PDF or images). Each page's columns 1, 2, 14 and 17 are found and read by the local model; the cells it read are outlined on the page.</div>
+    <div class="hint for-mbatch" hidden>Mutation batch works on whole folders: pick a folder on the right. Every mutation PDF in it and its subfolders is read in turn (register pages, khasra list), and its table is built live on the right and saved next to the PDF. District / Tehsil / Mouza come from the award in the same folder.</div>
     <div class="hint for-award" hidden>Open an award PDF and press Read award. The land table (Sqr. No / Khasra No. / K / M) is read page by page until its total; the square number is carried down and joined to each khasra.</div>
     <div class="hint for-translate" hidden>Drag over the page to select text. It is transcribed into “Original text” (fix any errors there), then translated. A paragraph or column at a time works best.</div>
     <div id="viewer">
@@ -271,6 +277,24 @@
     </div>
   </section>
 
+  <section class="pane for-mbatch" id="mbatchPane" hidden>
+    <div class="bar">
+      <label style="flex:1;display:flex;gap:6px;align-items:center">Folder <input type="text" id="mbFolder" placeholder="e.g. D:\Danish Enterprises\Motorway\M3 Data" style="flex:1;min-width:12em"></label>
+      <button id="mbBrowse" title="Pick the folder (the window opens on the PC running the tool)">Browse…</button>
+      <label title="Also convert documents that already have their Excel file or review note"><input type="checkbox" id="mbRedo"> Redo converted</label>
+      <button class="primary" id="mbStart" title="Convert every mutation PDF in this folder and its subfolders, saving each Excel file next to its PDF">Convert folder</button>
+      <button id="mbStop" hidden>Stop</button>
+    </div>
+    <div class="hint" style="padding-top:8px">One row per khasra (Mutation No, Khata Khatuni, Khasra No.); only the document's total area is given — its grand total (میزان کل), or the khata sub-totals added up when there is none. Documents that can't be read or have over 30% of their data missing get a “… - REVIEW MANUALLY.txt” note next to them. The models are checked every 10 pages and reloaded or restarted if they degrade.</div>
+    <div id="mbWrap">
+      <div id="mbState" class="hint" style="padding:0 0 6px"></div>
+      <h3 class="sub" id="mbDoc" style="margin-top:4px"></h3>
+      <div style="overflow:auto"><table class="totals" id="mbTable"></table></div>
+      <h3 class="sub">Log</h3>
+      <pre id="mbLog" class="joblog"></pre>
+    </div>
+  </section>
+
   <section class="pane for-table" id="tablePane">
     <div class="bar">
       <span class="grp">
@@ -308,6 +332,7 @@ let grid = null;  // table editor (grid.js); holds the table data
 let mGrid = null; // mutation register table (fixed headers)
 let aGrid = null; // award land table (fixed headers)
 const AB = { running: false, timer: null, asked: null };  // award folder conversion (server job)
+const MB = { running: false, timer: null, doc: '' };       // mutation folder conversion (server job)
 const M = { flags: new Map(), notes: [], emptyPages: new Set(), khataTotals: new Map(), alts: new Map(), cells: {}, running: false, halt: false, sinceCheck: 0 };  // flags: "award|khata" -> {col: note}
 
 function status(msg, err = false) { const s = $('#status'); s.textContent = msg; s.classList.toggle('err', err); }
@@ -348,7 +373,7 @@ async function loadModels() {
 function setTab(tab) {
   state.tab = tab;
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  document.querySelectorAll('.for-table, .for-translate, .for-mutation, .for-award').forEach(el => el.hidden = !el.classList.contains('for-' + tab));
+  document.querySelectorAll('.for-table, .for-translate, .for-mutation, .for-award, .for-mbatch').forEach(el => el.hidden = !el.classList.contains('for-' + tab));
   try { localStorage.setItem('tab', tab); } catch {}
   refreshButtons();
 }
@@ -1093,7 +1118,7 @@ async function abPoll() {
     pre.textContent = j.log.join('\n');
     if (atEnd) pre.scrollTop = pre.scrollHeight;
     const r = j.result;
-    $('#aBatchState').textContent = j.running ? (j.n ? `Converting ${j.root} — folder ${j.i + 1} of ${j.n}: ${j.folder}` : `Starting on ${j.root}…`)
+    $('#aBatchState').textContent = j.running ? (j.n ? `Converting ${j.root} — folder ${j.i + 1} of ${j.n}: ${j.item}` : `Starting on ${j.root}…`)
       : r && r.error ? `Stopped with an error: ${r.error}`
       : r ? `Finished: ${r.done} converted, ${r.skipped} skipped, ${r.failed} failed${r.stopped ? ' (stopped)' : ''}. Each Excel file is saved next to its award; the log is in "Award Batch Log.txt" in the folder.` : '';
   }
@@ -1105,10 +1130,75 @@ async function abPoll() {
 }
 abPoll();  // pick up a conversion that is already running (page reloaded, or opened from another PC)
 
+/* ---------- mutation batch ---------- */
+// Folder conversion of mutation documents (mutation_batch.py on the server). The table of the document
+// being read is shown live, page by page; when it is saved the next document's table replaces it.
+try { $('#mbFolder').value = localStorage.getItem('mb.folder') || ''; } catch {}
+$('#mbFolder').addEventListener('change', () => { try { localStorage.setItem('mb.folder', $('#mbFolder').value.trim()); } catch {} });
+$('#mbBrowse').onclick = async () => {
+  status('Pick the folder in the window that opened (it may be behind the browser)…');
+  try {
+    const j = await api('/api/award/browse', { method: 'POST', body: '{}' });
+    if (j.path) { $('#mbFolder').value = j.path; $('#mbFolder').dispatchEvent(new Event('change')); status('Folder selected.'); }
+    else status('No folder selected.');
+  } catch (e) { status(e.message, true); }
+};
+$('#mbStart').onclick = async () => {
+  const root = $('#mbFolder').value.trim().replace(/^"|"$/g, '');
+  if (!root) { status('Type or browse to a folder first.', true); return; }
+  try {
+    const s = await api('/api/mutation/scan', { method: 'POST', body: JSON.stringify({ root }) });
+    if (!s.ok) { status(s.error, true); return; }
+    if (!s.docs) { status('No mutation PDFs found in that folder or its subfolders.', true); return; }
+    const todo = $('#mbRedo').checked ? s.docs : s.docs - s.done;
+    if (!confirm(`${s.docs} mutation document${s.docs === 1 ? '' : 's'} found in ${s.folders} folder${s.folders === 1 ? '' : 's'}` +
+      `${s.done && !$('#mbRedo').checked ? ` (${s.done} already done, skipped)` : ''}. Convert ${todo} now?`)) return;
+    await api('/api/mutation/batch/start', { method: 'POST', body: JSON.stringify({ root, model: $('#model').value, redo: $('#mbRedo').checked }) });
+    mbPoll();
+  } catch (e) { status(e.message, true); }
+};
+$('#mbStop').onclick = async () => { await api('/api/mutation/batch/stop', { method: 'POST', body: '{}' }).catch(() => {}); status('Stopping after the current page…'); };
+function mbRenderTable(live) {
+  const t = $('#mbTable');
+  t.innerHTML = '';
+  if (!live) return;
+  const head = t.createTHead().insertRow();
+  live.headers.forEach(h => { const th = document.createElement('th'); th.textContent = h; head.append(th); });
+  const body = t.createTBody();
+  live.rows.forEach(r => {
+    const tr = body.insertRow();
+    if (/[A-Za-z]/.test(String(r[6] ?? ''))) tr.className = 'tot';  // Total / Sub-total rows
+    r.forEach(v => { tr.insertCell().textContent = v ?? ''; });
+  });
+}
+async function mbPoll() {
+  clearTimeout(MB.timer);
+  let j;
+  try { j = await api('/api/mutation/batch/status', { method: 'POST', body: '{}' }); } catch { MB.timer = setTimeout(mbPoll, 4000); return; }
+  MB.running = j.running;
+  const pre = $('#mbLog'), atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+  pre.textContent = j.log.join('\n');
+  if (atEnd) pre.scrollTop = pre.scrollHeight;
+  const r = j.result;
+  $('#mbState').textContent = j.running ? (j.n ? `Converting ${j.root} — document ${j.i + 1} of ${j.n}: ${j.item}` : `Starting on ${j.root}…`)
+    : r && r.error ? `Stopped with an error: ${r.error}`
+    : r ? `Finished: ${r.done} converted, ${r.review} need manual review, ${r.skipped} skipped, ${r.failed} failed${r.stopped ? ' (stopped)' : ''}. Each Excel file is saved next to its PDF; the log is in "Mutation Batch Log.txt" in the folder.` : '';
+  const live = j.live;
+  $('#mbDoc').textContent = live ? `${live.doc} — page ${live.page} of ${live.pages}${j.running && live.page < live.pages ? ' (reading…)' : ''}` : '';
+  if (!live || live.doc !== MB.doc || live.rows.length !== $('#mbTable').rows.length - 1) mbRenderTable(live);
+  MB.doc = live ? live.doc : '';
+  refreshButtons();
+  if (j.running) MB.timer = setTimeout(mbPoll, 2000);
+}
+mbPoll();
+
 function refreshButtons() {
   const has = !!state.doc;
+  $('#mbStart').disabled = MB.running || AB.running;
+  $('#mbBrowse').disabled = MB.running;
+  $('#mbStop').hidden = !MB.running;
   if (aGrid) {
-    $('#aBatch').disabled = AB.running || A.running;
+    $('#aBatch').disabled = AB.running || A.running || MB.running;
     $('#aBrowse').disabled = AB.running;
     $('#aBatchStop').hidden = !AB.running;
     $('#aRead').disabled = !has || A.running || state.busy || M.running || AB.running;
@@ -1139,7 +1229,7 @@ function refreshButtons() {
 window.addEventListener('resize', drawSel);
 let savedTab = 'table';
 try { savedTab = localStorage.getItem('tab') || 'table'; } catch {}
-setTab(['translate', 'mutation', 'award'].includes(savedTab) ? savedTab : 'table');
+setTab(['translate', 'mutation', 'award', 'mbatch'].includes(savedTab) ? savedTab : 'table');
 loadModels().catch(e => status(e.message, true));
 </script>
 </body>

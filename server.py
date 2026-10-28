@@ -27,6 +27,7 @@ import pymupdf
 import award
 import award_batch
 import mutation
+import mutation_batch
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -689,66 +690,130 @@ def build_xlsx(title, rows, header, merges=()):
 
 # ------------------------------------------------------------------ HTTP ---
 
-# -------------------------------------------------------- award folder batch --
-# One folder conversion at a time, run in a background thread; the Award tab polls its state and answers
-# the "which award?" question for folders that hold several awards.
+# ------------------------------------------------------------- folder batches --
+# Award and mutation folder conversions run in a background thread, one batch at a time (they share the
+# models); the web tabs poll a job's state, answer its questions and show what it is building.
 
-AWARD_JOB = {"running": False, "log": [], "root": "", "i": 0, "n": 0, "folder": "", "question": None,
-             "result": None}
-_AWARD_LOCK = threading.Lock()
-_AWARD_ANSWER = {"event": threading.Event(), "path": None}
-_AWARD_STOP = threading.Event()
+class Job:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.answer = threading.Event()
+        self.answer_path = None
+        self.halt = threading.Event()
+        self.state = {"running": False, "log": [], "root": "", "i": 0, "n": 0, "item": "", "question": None,
+                      "live": None, "result": None}
+
+    def log(self, line):
+        with self.lock:
+            self.state["log"].append(line)
+            del self.state["log"][:-500]
+
+    def update(self, **kw):
+        with self.lock:
+            self.state.update(kw)
+
+    def snapshot(self):
+        with self.lock:
+            s = dict(self.state, log=self.state["log"][-200:])
+        if s["question"]:
+            s["question"] = dict(s["question"], seconds_left=max(0, int(s["question"]["deadline"] - time.time())))
+        return s
+
+    def ask(self, question, timeout):
+        """Put a question to the web tab; -> the answer, or None after `timeout` seconds."""
+        self.answer.clear()
+        self.answer_path = None
+        self.update(question=dict(question, deadline=time.time() + timeout))
+        answered = self.answer.wait(timeout)
+        self.update(question=None)
+        return self.answer_path if answered else None
+
+    def reply(self, path):
+        self.answer_path = path
+        self.answer.set()
+
+    def stop(self):
+        self.halt.set()
+        self.answer.set()  # an open question takes its default
+
+    def start(self, root, work):
+        """Run work(job) in the background. Only one batch (of any kind) at a time."""
+        with _JOBS_LOCK:
+            if any(j.state["running"] for j in JOBS.values()):
+                raise RuntimeError("A folder is already being converted - wait for it to finish or stop it.")
+            if not os.path.isdir(root):
+                raise RuntimeError(f"Folder not found: {root}")
+            self.halt.clear()
+            self.update(running=True, log=[], root=root, i=0, n=0, item="", question=None, live=None, result=None)
+
+        def run():
+            try:
+                keep_wsl_alive()
+                res = work(self)
+            except Exception as e:
+                self.log(f"!! The batch stopped: {e}")
+                res = {"error": str(e)}
+            self.update(running=False, question=None, result=res)
+
+        threading.Thread(target=run, daemon=True).start()
+
+
+JOBS = {"award": Job(), "mutation": Job()}
+_JOBS_LOCK = threading.Lock()
 
 
 def award_job_start(root, model, redo):
-    with _AWARD_LOCK:
-        if AWARD_JOB["running"]:
-            raise RuntimeError("A folder is already being converted.")
-        if not os.path.isdir(root):
-            raise RuntimeError(f"Folder not found: {root}")
-        AWARD_JOB.update(running=True, log=[], root=root, i=0, n=0, folder="", question=None, result=None)
-        _AWARD_STOP.clear()
-
-    def log(line):
-        with _AWARD_LOCK:
-            AWARD_JOB["log"].append(line)
-            del AWARD_JOB["log"][:-500]
-
-    def step(i, n, folder):
-        with _AWARD_LOCK:
-            AWARD_JOB.update(i=i, n=n, folder=award_batch.folder_label(folder, root))
-
     def pick(folder, files):
         latest = max(files, key=award_batch.award_key)
-        _AWARD_ANSWER["event"].clear()
-        _AWARD_ANSWER["path"] = None
-        with _AWARD_LOCK:
-            AWARD_JOB["question"] = {
-                "folder": award_batch.folder_label(folder, root),
-                "files": [{"path": f, "name": os.path.basename(f), "latest": f == latest}
-                          for f in sorted(files, key=award_batch.award_key, reverse=True)],
-                "deadline": time.time() + award_batch.PICK_TIMEOUT}
-        answered = _AWARD_ANSWER["event"].wait(award_batch.PICK_TIMEOUT)
-        with _AWARD_LOCK:
-            AWARD_JOB["question"] = None
-        if answered and _AWARD_ANSWER["path"] == "*all*":
+        ans = job.ask({"folder": award_batch.folder_label(folder, root),
+                       "files": [{"path": f, "name": os.path.basename(f), "latest": f == latest}
+                                 for f in sorted(files, key=award_batch.award_key, reverse=True)]},
+                      award_batch.PICK_TIMEOUT)
+        if ans == "*all*":
             return list(files), award_batch.ALL_HOW
-        if answered and _AWARD_ANSWER["path"] in files:
-            return [_AWARD_ANSWER["path"]], "chosen by user"
+        if ans in files:
+            return [ans], "chosen by user"
         return [latest], f"auto - no answer in {award_batch.PICK_TIMEOUT // 60} minutes, latest award taken"
 
-    def work():
-        try:
-            keep_wsl_alive()
-            res = award_batch.run(sys.modules[__name__], root, model, pick, log, redo=redo,
-                                  stop=_AWARD_STOP.is_set, step=step)
-        except Exception as e:
-            log(f"!! The batch stopped: {e}")
-            res = {"error": str(e)}
-        with _AWARD_LOCK:
-            AWARD_JOB.update(running=False, question=None, result=res)
+    job = JOBS["award"]
+    job.start(root, lambda j: award_batch.run(
+        sys.modules[__name__], root, model, pick, j.log, redo=redo, stop=j.halt.is_set,
+        step=lambda i, n, folder: j.update(i=i, n=n, item=award_batch.folder_label(folder, root))))
 
-    threading.Thread(target=work, daemon=True).start()
+
+def register_ask(model, prompt, png):
+    """One register cell read by a vision model (mutation.read_page's `ask`), retried when the
+    connection drops (usually WSL shutting down under Ollama)."""
+    body = {"model": model, "stream": False, "keep_alive": "15m",
+            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 200},
+            "messages": [{"role": "user", "content": prompt, "images": [base64.b64encode(png).decode()]}]}
+    for attempt in range(3):
+        try:
+            return ollama_request("/api/chat", body, timeout=600).get("message", {}).get("content", "")
+        except (OSError, http.client.HTTPException):
+            if attempt == 2:
+                raise
+            time.sleep(2)
+            if not ollama_up():
+                ensure_ollama()
+
+
+def mutation_job_start(root, model, redo):
+    def ask_json(prompt, png, schema):  # the award's place names
+        body = {"model": model, "stream": False, "format": schema, "keep_alive": "15m",
+                "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 400},
+                "messages": [{"role": "user", "content": prompt, "images": [base64.b64encode(png).decode()]}]}
+        return ollama_request("/api/chat", body, timeout=600).get("message", {}).get("content", "")
+
+    def work(j):
+        def live(doc, rows, page, pages):
+            j.update(live={"doc": doc, "rows": rows, "page": page, "pages": pages, "headers": mutation_batch.HEADERS})
+
+        return mutation_batch.run(sys.modules[__name__], root, (model, TRANSLATE_MODEL), register_ask, ask_json,
+                                  j.log, redo=redo, stop=j.halt.is_set, live=live,
+                                  step=lambda i, n, item: j.update(i=i, n=n, item=item))
+
+    JOBS["mutation"].start(root, work)
 
 
 def pick_folder_dialog():
@@ -758,7 +823,7 @@ def pick_folder_dialog():
     win = tk.Tk()
     win.withdraw()
     win.attributes("-topmost", True)
-    path = filedialog.askdirectory(parent=win, title="Folder with award PDFs (subfolders are included)")
+    path = filedialog.askdirectory(parent=win, title="Folder to convert (subfolders are included)")
     win.destroy()
     return os.path.normpath(path) if path else ""
 
@@ -893,25 +958,8 @@ class Handler(BaseHTTPRequestHandler):
                 doc = self.get_doc(req["id"])
                 reader = req.get("model") or DEFAULT_MODEL
                 keep_wsl_alive()
-
-                def ask(model, prompt, png):  # one small cell per call
-                    body = {"model": model, "stream": False, "keep_alive": "15m",
-                            "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 200},
-                            "messages": [{"role": "user", "content": prompt, "images": [base64.b64encode(png).decode()]}]}
-                    for attempt in range(3):
-                        try:
-                            return ollama_request("/api/chat", body, timeout=600).get("message", {}).get("content", "")
-                        except (OSError, http.client.HTTPException):
-                            # Dropped connection: usually WSL shutting down under Ollama. Bring it back
-                            # (keep-alive + wait for Ollama), then try the same cell again.
-                            if attempt == 2:
-                                raise
-                            time.sleep(2)
-                            if not ollama_up():
-                                ensure_ollama()
-
                 t0 = time.time()
-                out = mutation.read_page(doc[int(req["page"])], norm_rot(req.get("rot")), ask, reader,
+                out = mutation.read_page(doc[int(req["page"])], norm_rot(req.get("rot")), register_ask, reader,
                                          TRANSLATE_MODEL, lock=DOCS_LOCK,
                                          plot_field="khasra" if req.get("plot") == "khasra" else "katat")  # held while rendering, released for model calls
                 out["seconds"] = round(time.time() - t0, 1)
@@ -982,27 +1030,28 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {"ok": True, "folders": len(folders), "done": sum(1 for f in folders if f[2]),
                                        "multi": sum(1 for f in folders if len(f[1]) > 1)})
 
-            if url.path == "/api/award/batch/start":
-                req = json.loads(self.body())
-                award_job_start(req.get("root", "").strip().strip('"'), req.get("model") or DEFAULT_MODEL,
-                                bool(req.get("redo")))
-                return self.send(200, {"ok": True})
+            if url.path == "/api/mutation/scan":  # what a mutation folder conversion would do
+                root = json.loads(self.body()).get("root", "").strip().strip('"')
+                if not os.path.isdir(root):
+                    return self.send(200, {"ok": False, "error": f"Folder not found: {root}"})
+                groups = mutation_batch.find_documents(root)
+                docs = sum(len(f) for _d, f in groups)
+                done = sum(mutation_batch.is_done(p, os.listdir(d)) for d, f in groups for p in f)
+                return self.send(200, {"ok": True, "docs": docs, "folders": len(groups), "done": done})
 
-            if url.path == "/api/award/batch/status":
-                with _AWARD_LOCK:
-                    job = dict(AWARD_JOB, log=AWARD_JOB["log"][-200:])
-                if job["question"]:
-                    job["question"] = dict(job["question"], seconds_left=max(0, int(job["question"]["deadline"] - time.time())))
-                return self.send(200, job)
-
-            if url.path == "/api/award/batch/answer":
-                _AWARD_ANSWER["path"] = json.loads(self.body()).get("path")
-                _AWARD_ANSWER["event"].set()
-                return self.send(200, {"ok": True})
-
-            if url.path == "/api/award/batch/stop":
-                _AWARD_STOP.set()
-                _AWARD_ANSWER["event"].set()  # an open "which award?" question takes the latest
+            m = re.fullmatch(r"/api/(award|mutation)/batch/(start|status|answer|stop)", url.path)
+            if m:
+                job, action = JOBS[m.group(1)], m.group(2)
+                req = json.loads(self.body() or b"{}")
+                if action == "start":
+                    start = award_job_start if m.group(1) == "award" else mutation_job_start
+                    start(req.get("root", "").strip().strip('"'), req.get("model") or DEFAULT_MODEL, bool(req.get("redo")))
+                elif action == "status":
+                    return self.send(200, job.snapshot())
+                elif action == "answer":
+                    job.reply(req.get("path"))
+                else:
+                    job.stop()
                 return self.send(200, {"ok": True})
 
             if url.path == "/api/award/export":
