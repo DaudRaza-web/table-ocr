@@ -121,7 +121,13 @@ def estimate_skew(page, rot=0):
     z = 1000 / max(page.rect.width, page.rect.height)
     pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z).prerotate(rot), colorspace=pymupdf.csGRAY, alpha=False)
     w, h, s, st = pix.width, pix.height, pix.samples, pix.stride
-    pts = [(x, y) for y in range(h) for x in range(w) if s[y * st + x] < 160]
+    # A dark line (nearly) right across the page near its edge is the scanner's edge, not the content:
+    # perfectly straight, it would win the projection at 0° however tilted the table is.
+    margin = 0.1 * h
+    edge_rows = {y for y in range(h) if (y < margin or y > h - margin)
+                 and sum(1 for x in range(w) if s[y * st + x] < 160) > 0.85 * w}
+    edge_rows |= {y + d for y in edge_rows for d in (-2, -1, 1, 2)}
+    pts = [(x, y) for y in range(h) if y not in edge_rows for x in range(w) if s[y * st + x] < 160]
     if len(pts) < 500:
         return 0.0
     if len(pts) > 60000:

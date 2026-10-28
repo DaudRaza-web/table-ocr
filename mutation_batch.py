@@ -168,6 +168,14 @@ def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: Fa
                 res = {"ok": False, "records": [], "error": f"{type(e).__name__}: {e}", "crashed": True}
             bad = res.get("crashed") or (res["ok"] and any(
                 f in ("award", "katat") for rec in res["records"] for f in rec.get("flags", [])))
+            if not res["ok"] and not res.get("crashed"):
+                # No register grid: the scans in one document don't all face the same way, so try the
+                # page turned the other way round before giving up on it.
+                other = mutation.read_page(doc[n], (rot + 180) % 360, ask, reader, urdu,
+                                           lock=getattr(srv, "DOCS_LOCK", None), plot_field="khasra", keep_totals=True)
+                if other["ok"]:
+                    res = other
+                break
             if not bad or attempt:
                 break
             h = heal(srv, models, log)  # a page that failed or came back unreadable: are the models fine?
