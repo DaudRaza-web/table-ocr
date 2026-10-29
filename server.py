@@ -801,7 +801,7 @@ def register_ask(model, prompt, png):
 def mutation_job_start(root, model, redo):
     def ask_json(prompt, png, schema):  # the award's place names
         body = {"model": model, "stream": False, "format": schema, "keep_alive": "15m",
-                "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 400},
+                "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 3000},  # a whole page of entries
                 "messages": [{"role": "user", "content": prompt, "images": [base64.b64encode(png).decode()]}]}
         return ollama_request("/api/chat", body, timeout=600).get("message", {}).get("content", "")
 
@@ -1037,9 +1037,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not os.path.isdir(root):
                     return self.send(200, {"ok": False, "error": f"Folder not found: {root}"})
                 groups = mutation_batch.find_documents(root)
-                docs = sum(len(f) for _d, f in groups)
-                done = sum(mutation_batch.is_done(p, os.listdir(d)) for d, f in groups for p in f)
-                return self.send(200, {"ok": True, "docs": docs, "folders": len(groups), "done": done})
+                docs = sum(len(f) for _d, f, _u in groups)
+                done = sum(mutation_batch.is_done(p, os.listdir(d)) for d, f, u in groups for p in f + u)
+                other = sum(len(u) for _d, _f, u in groups)  # named neither mutation nor award: checked when run
+                return self.send(200, {"ok": True, "docs": docs, "other": other, "folders": len(groups), "done": done})
 
             m = re.fullmatch(r"/api/(award|mutation)/batch/(start|status|answer|stop)", url.path)
             if m:

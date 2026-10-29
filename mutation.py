@@ -60,11 +60,14 @@ def parse_khasra(text):
     Return the full khasra numbers in printed order, repeats included (each is a separate entry with
     its own area): '37/24/1, 37/23/2, 47/3/1, 37/23/2'. The under-bar numbers are dropped."""
     # The list ends with "قطعات N" (the number of plots); anything after it - the count, a share like
-    # "1/1" - is not a khasra number.
-    t = re.split(r"قطعا?ت|قطعہ", _norm(text))[0]
+    # "1/1" - is not a khasra number. (The computer-printed form writes "سالم کھاتہ قطعات N" - the
+    # whole khata, N plots - first and the khasra numbers after it: then the numbers after it count.)
+    parts = re.split(r"قطعا?ت|قطعہ", _norm(text), maxsplit=1)
+    khasra_re = r"(?<![\d/])/?\d{1,5}(?:/\d{1,5})+(?![\d/])"
+    t = parts[0] if len(parts) == 1 or re.search(khasra_re, re.sub(r"[ \t]*/[ \t]*", "/", parts[0])) else parts[1]
     t = re.sub(r"[ \t]*/[ \t]*", "/", t)  # '56 / 7 / 2' -> '56/7/2', without joining lines
     # Some registers print a khasra with a leading slash ('/69/7'); keep it as printed.
-    return ", ".join(re.findall(r"(?<![\d/])/?\d{1,5}(?:/\d{1,5})+(?![\d/])", t))
+    return ", ".join(re.findall(khasra_re, t))
 
 
 def kms_units(k, m, s, per):
@@ -224,20 +227,36 @@ def find_grid(page, rot=0, dark=200):
     # The column-number row (١ … ١٧): the first SHORT band crossed by 18 rules (17 columns). Short bands
     # are sensitive to how strictly a rule must span them, so try several strictness levels; extra
     # rules (a frame, the next page peeking in) are weeded out by matching the form's column layout.
+    # Other register forms (the computer-printed one has 16 columns) don't match that layout: the first
+    # short band with 13-21 rules is taken instead, and its columns are told apart by position.
     num = v = None
+    generic = None
     for i, (a, b, _) in enumerate(bands):
         if b - a > 0.06 * h:
             continue
         for frac in (0.9, 0.8, 0.7, 0.6, 0.5):
-            v = pick_columns(verticals(a, b, frac))
+            xs = verticals(a, b, frac)
+            v = pick_columns(xs)
             if v:
                 break
+            if generic is None and 13 <= len(xs) <= 21:
+                generic = (i, xs)
         if v:
             num = i
             break
+    layout = "register17"
     if num is None:
-        return None
-    cols =[(v[17 - k] / w, v[18 - k] / w) for k in range(1, 18)]  # column 1 is rightmost
+        if generic is None:
+            return None
+        num, v = generic
+        # a frame or the paper's edge just outside the table shows up as a sliver of a column
+        while len(v) > 13 and v[1] - v[0] < 0.006 * w:
+            v = v[1:]
+        while len(v) > 13 and v[-1] - v[-2] < 0.006 * w:
+            v = v[:-1]
+        layout = "generic"
+    n = len(v) - 1
+    cols = [(v[n - k] / w, v[n + 1 - k] / w) for k in range(1, n + 1)]  # column 1 is rightmost
 
     # Header: after the number row comes a row of merged group headings (few rules) and then the
     # column titles. Data rows are the ruled bands after that which still carry most column rules.
@@ -257,8 +276,18 @@ def find_grid(page, rot=0, dark=200):
             break  # below the table
         rows.append((a / h, b / h))
     span = v[-1] - v[0]
-    fit = max(abs((x - v[0]) / span - t) for x, t in zip(v, FORM_RULES)) if span > 0 else 1.0
-    return {"cols": cols, "rows": rows, "top": bands[num][0] / h, "size": (w, h), "fit": fit}
+    if layout == "register17":
+        fit = max(abs((x - v[0]) / span - t) for x, t in zip(v, FORM_RULES)) if span > 0 else 1.0
+        # the columns read, by their place in the form: 1 award/mutation no, 2 khata, 14 area of the old
+        # entry, 16 khasra numbers and 17 their areas
+        roles = {1: 1, 2: 2, 14: 14, 16: 16, 17: 17}
+    else:
+        fit = 1.0  # no fixed layout to compare with
+        # Every register form keeps the mutation number and the khata in its two rightmost columns and
+        # the new entry's khasra numbers and areas in its two leftmost ones.
+        roles = {1: 1, 2: 2, 14: None, 16: n - 1, 17: n}
+    return {"cols": cols, "rows": rows, "top": bands[num][0] / h, "size": (w, h), "fit": fit, "layout": layout,
+            "roles": roles}
 
 
 GRID_FIT = 0.03  # worst deviation from the form's column layout (in table widths) accepted as the register
@@ -273,18 +302,25 @@ def locate_grid(page, rot):
     tries = [(est, 200), (est, 230)] + [(est + d, 200) for d in (-0.5, 0.5, -1.0, 1.0)]
     if abs(est) >= 0.1:
         tries.insert(2, (0.0, 200))  # the estimate itself may be the problem
-    near = None  # closest miss, used if nothing fits the form well
+    near = generic = None  # closest miss of the 17-column form; another register form
     for skew, dark in tries:
         pg, r = (straightened(page, rot, skew, longest=3600), 0) if abs(skew) >= 0.1 else (page, rot)
         try:
             g = find_grid(pg, r, dark)
         except Exception:
             g = None
-        if g and g["fit"] <= GRID_FIT:
+        if not g:
+            continue
+        if g["layout"] == "generic":
+            # another form: upright when its column-number row is in the top half of the page
+            if generic is None and g["top"] < 0.5:
+                generic = (pg, r, g, skew)
+            continue
+        if g["fit"] <= GRID_FIT:
             return pg, r, g, skew
-        if g and g["fit"] <= 0.045 and (near is None or g["fit"] < near[2]["fit"]):
+        if g["fit"] <= 0.045 and (near is None or g["fit"] < near[2]["fit"]):
             near = (pg, r, g, skew)
-    return near
+    return near or generic
 
 
 def orientation_from_grid(page):
@@ -304,11 +340,13 @@ def orientation_from_grid(page):
                     g = find_grid(straightened(page, rot, skew, longest=2400), 0)
         except Exception:
             g = None
-        if not g or g["fit"] > 0.03 or g["top"] > 0.5:
+        if not g or g["top"] > 0.5 or (g["layout"] != "generic" and g["fit"] > 0.03):
             continue
-        if best is None or g["fit"] < best[1]:
-            best = (rot, g["fit"])
-        if g["fit"] < 0.012:
+        # another register form has no layout to fit: its number row near the top is what says upright
+        fit = g["fit"] if g["layout"] != "generic" else 0.5 + g["top"]
+        if best is None or fit < best[1]:
+            best = (rot, fit)
+        if fit < 0.012:
             break  # clearly the form, no need to try the others
     return best[0] if best else None
 
@@ -390,12 +428,15 @@ def build_khata(numbers, layout):
     return items, True
 
 
-def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="katat", keep_totals=False):
+def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="katat", keep_totals=False,
+              read_footer=False):
     """plot_field: "katat" = the small number under the column 17 total (some registers);
     "khasra" = the khasra numbers listed in column 16 (registers that list khasra numbers instead).
     The value is returned in the record's "katat" key either way, with the flag "katat".
     keep_totals (khasra mode): also return rows that only carry a column 17 area, such as the
-    document's grand total (میزان کل), with "total_only": True."""
+    document's grand total (میزان کل), with "total_only": True.
+    read_footer: also look for the total printed under the table (the computer-printed form) and return it
+    as "footer_total" ("" when the footer has none)."""
     """Read every mutation entry on one register page.
     `ask(model, prompt, png) -> str` calls the local vision model. `lock` (optional) is held while
     rendering — MuPDF isn't thread-safe — but not during the slow model calls. Returns a dict:
@@ -411,21 +452,24 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
         return {"ok": False, "records": [], "error": "Couldn't find the 17-column register table on this page. "
                 "If it is sideways, rotate it upright first; if it isn't a Register Dakhil Kharij page, type the entry in by hand."}
     cols = grid["cols"]
+    roles = grid.get("roles") or {c: c for c in (1, 2, 14, 16, 17)}  # cell -> its column in this form
     with lock:
         location = header_box(page, rot, grid)
     records = []
     for y0, y1 in grid["rows"]:
         def rect(col, top=0.0, bottom=1.0):
-            x0, x1 = cols[col - 1]
+            x0, x1 = cols[roles[col] - 1]
             pad = (x1 - x0) * 0.04
             return (x0 + pad, y0 + (y1 - y0) * top + 0.003, x1 - pad, y0 + (y1 - y0) * bottom - 0.003)
 
         # The khata stack can run most of the way down column 2; the other values sit near the top.
-        cells = {1: rect(1, 0, 0.5), 2: rect(2, 0, 1.0), 14: rect(14, 0, 0.5), 17: rect(17, 0, 0.5)}
+        cells = {1: rect(1, 0, 0.5), 2: rect(2, 0, 1.0), 17: rect(17, 0, 0.5)}
+        if roles.get(14):
+            cells[14] = rect(14, 0, 0.5)
         if plot_field == "khasra":
             # A list of khasra numbers can run down the cell, and long ones touch the right-hand rule,
             # so take the full height and reach a little past that rule.
-            x0, x1 = cols[15]
+            x0, x1 = cols[roles[16] - 1]
             cells[16] = (x0 + (x1 - x0) * 0.04, y0 + 0.003, x1 + (x1 - x0) * 0.06, y1 - 0.003)
             cells[17] = rect(17, 0, 1.0)  # one area per khasra, line for line, sometimes a total at the end
         def render(r):
@@ -467,25 +511,33 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
             khata = format_khata(items)
 
         kanal = marla = sarsai = katat = ""
-        if inked[14]:
+        if inked.get(14):
             kms = parse_kms(ask(reader_model, PROMPT_PLAIN, png[14]))
             if kms:
                 kanal, marla, sarsai = kms
             else:
                 notes.append("column 14 area could not be read"); flags.append("area"); conf = "low"
-        khasra_items, col17_total = [], ""
+        khasra_items, col17_total, whole = [], "", None
         if plot_field == "khasra":
             if inked[16]:
-                katat = parse_khasra(ask(reader_model, PROMPT_PLAIN, png[16]))
-                if not katat:
+                raw = _norm(ask(reader_model, PROMPT_PLAIN, png[16]))
+                katat = parse_khasra(raw)
+                if "سالم" in raw or (not katat and not re.search(r"\d", raw)):
+                    # "سالم کھاتہ قطعات N": the whole khata changes hands, often with no khasra numbers
+                    # listed (words only in the cell - a khasra list always has digits). The number of
+                    # plots is in the cell or under the area in column 17.
+                    n = re.search(r"قطعا?ت\D{0,6}(\d{1,3})", raw)
+                    whole = int(n.group(1)) if n else 0
+                if not katat and whole is None:
                     notes.append("khasra number in column 16 could not be read"); flags.append("katat"); conf = "low"
             khasras = katat.split(", ") if katat else []
-            areas, alts = [], {}
+            areas, alts, a1_text = [], {}, ""
             if inked[17]:
                 # Read the areas with both models: each misreads a digit now and then, in different
                 # places. Disagreements are kept as alternatives; the table settles them with the
                 # khata's total (whichever combination makes the khata add up).
-                a1 = KMS.findall(_norm(ask(reader_model, PROMPT_PLAIN, png[17])))
+                a1_text = _norm(ask(reader_model, PROMPT_PLAIN, png[17]))
+                a1 = KMS.findall(a1_text)
                 a2 = KMS.findall(_norm(ask(urdu_model, PROMPT_PLAIN, png[17])))
                 fits = lambda a: len(a) in (len(khasras), len(khasras) + 1)
                 areas = a1 if fits(a1) or not fits(a2) else a2
@@ -493,6 +545,9 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
                 if len(other) == len(areas):
                     alts = {i: "-".join(o) for i, (a, o) in enumerate(zip(areas, other)) if a != o}
             khasra_items, col17_total, msg = pair_khasra_areas(khasras, areas)
+            if whole == 0 and inked[17]:  # plots count printed under the area ("32-14-0 / 1")
+                n = re.search(r"\d+-\d+-\d+(?:\.\d+)?\s+(\d{1,3})(?![\d-])", a1_text)
+                whole = int(n.group(1)) if n else 0
             for i, item in enumerate(khasra_items):
                 if i in alts:
                     item["alt"] = alts[i]
@@ -502,13 +557,13 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
             total, katat = parse_total_katat(ask(reader_model, PROMPT_PLAIN, png[17]))
             if not katat:
                 notes.append("katat under the column 17 total could not be read"); flags.append("katat"); conf = "low"
-        continuation = not inked[14] and not inked[17]
+        continuation = not inked.get(14) and not inked[17]
         khasra_only = total_only = False
         if not khata and not (kanal or marla or sarsai):
             # Only more owners for the award, or a summary page (totals, share-transferred box) with no
             # khata and no column-14 area: nothing to put in the table — unless it lists khasra numbers
             # (khasra mode), which the caller adds if they aren't in the table yet.
-            if not (plot_field == "khasra" and katat):
+            if not (plot_field == "khasra" and (katat or whole is not None)):
                 if not (keep_totals and col17_total):
                     continue
                 total_only = True
@@ -520,9 +575,26 @@ def read_page(page, rot, ask, reader_model, urdu_model, lock=None, plot_field="k
         records.append({"award": award, "khata": khata, "katat": katat, "kanal": kanal, "marla": marla,
                         "sarsai": sarsai, "continuation": continuation, "confidence": conf, "notes": "; ".join(notes),
                         "flags": flags, "khasra_only": khasra_only, "total_only": total_only,
-                        "khasra_items": khasra_items, "col17_total": col17_total,
+                        "khasra_items": khasra_items, "col17_total": col17_total, "whole_khata": whole,
                         "cells": {str(c): r for c, r in cells.items()}})  # the cells read, for outlining
-    return {"ok": True, "records": records, "error": "", "grid": grid, "skew": round(skew, 2), "location": location}
+    footer_total = None  # None: not looked at
+    if read_footer and grid["rows"] and records:
+        # The computer-printed register prints the mutation's total under the table, in its footer
+        # ("میزان کل رقبہ منتقلہ 57-0-0"); the old register's footer has prices and dates but no area. The
+        # model tends to drop the Urdu words, so any real area there counts (a date such as 12-10-2017
+        # has a 4-digit year, and Marla never reach 20).
+        y = grid["rows"][-1][1]
+        with lock:
+            png = cell_png(page, rot, (0.02, y, 0.98, 0.985), longest=1800)
+        text = _norm(ask(reader_model, PROMPT_PLAIN, png))
+        footer_total = ""
+        for m in KMS.finditer(text):
+            k, mm, s = m.groups()
+            if int(mm) < 20 and float(s) < 272 and len(s.split(".")[0]) <= 3 and len(k) <= 5:
+                footer_total = "-".join(m.groups())
+                break
+    return {"ok": True, "records": records, "error": "", "grid": grid, "skew": round(skew, 2), "location": location,
+            "footer_total": footer_total}
 
 
 def header_box(page, rot, grid):
@@ -532,7 +604,7 @@ def header_box(page, rot, grid):
     z = RENDER_LONG / max(page.rect.width, page.rect.height)
     pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z).prerotate(rot), colorspace=pymupdf.csGRAY, alpha=False)
     w, h, D = _dark_rows(pix)
-    xa, xb = int(grid["cols"][16][0] * w), int(grid["cols"][0][1] * w)  # the table's left and right edges
+    xa, xb = int(grid["cols"][-1][0] * w), int(grid["cols"][0][1] * w)  # the table's left and right edges
     top = int(grid["top"] * h) - 4
     inked = lambda y: sum(D[y][xa:xb]) > 0.003 * (xb - xa)
     # Walk up from the table's top border to the nearest line of text, then to its top.

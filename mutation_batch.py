@@ -37,10 +37,17 @@ def is_mutation(name):
     return n.endswith(".pdf") and ("mutation" in n or "intiqal" in n) and "correction" not in n
 
 
+def _stem(path):
+    return re.sub(r"\.pdf$", "", os.path.basename(path), flags=re.I)
+
+
 def output_name(path, numbers, place):
-    nos = " & ".join(numbers) or re.sub(r"\.pdf$", "", os.path.basename(path), flags=re.I)
+    nos = " & ".join(numbers) or _stem(path)
     mouza = re.sub(r'[<>:"/\\|?*]', "-", place.get("mouza", "")).strip()
-    return " ".join(x for x in ("Mutation", nos, mouza, "- Land.xlsx") if x)
+    # a file whose name doesn't give its mutation numbers (a phone scan) is named in brackets, so a later
+    # run can tell it has been done
+    src = f"({_stem(path)})" if numbers and not numbers_in_name(path) else ""
+    return " ".join(x for x in ("Mutation", nos, src, mouza, "- Land.xlsx") if x)
 
 
 def review_name(path):
@@ -53,22 +60,34 @@ def numbers_in_name(path):
     return re.findall(r"\d+", m.group(1)) if m else []
 
 
+def is_unnamed(name):
+    """A PDF whose name says neither mutation nor award (e.g. "CamScanner 29-10-2026 15.49.pdf"): what it
+    is has to be checked from its pages (classify)."""
+    low = name.lower()
+    return low.endswith(".pdf") and not is_mutation(name) and "award" not in low and "correction" not in low
+
+
 def find_documents(root):
-    """-> [(folder, [mutation pdfs])] for every folder under root that holds mutation documents."""
+    """-> [(folder, [mutation pdfs by name], [pdfs to check by content])] for every folder under root that
+    holds either."""
     out = []
     for folder, dirs, names in os.walk(root):
         dirs.sort()
         files = [os.path.join(folder, n) for n in sorted(names) if is_mutation(n)]
-        if files:
-            out.append((folder, files))
+        unnamed = [os.path.join(folder, n) for n in sorted(names) if is_unnamed(n)]
+        if files or unnamed:
+            out.append((folder, files, unnamed))
     return out
 
 
 def is_done(path, names):
     """A document is done when its Excel file or its review note exists."""
-    stem = re.sub(r"\.pdf$", "", os.path.basename(path), flags=re.I)
-    return os.path.basename(review_name(path)) in names or any(
-        n.startswith("Mutation") and n.endswith("- Land.xlsx") and _same_doc(n, stem) for n in names)
+    stem = _stem(path)
+    if os.path.basename(review_name(path)) in names:
+        return True
+    if not numbers_in_name(path):
+        return any(n.startswith("Mutation") and n.endswith("- Land.xlsx") and f"({stem})" in n for n in names)
+    return any(n.startswith("Mutation") and n.endswith("- Land.xlsx") and _same_doc(n, stem) for n in names)
 
 
 def _same_doc(xlsx, stem):
@@ -78,9 +97,10 @@ def _same_doc(xlsx, stem):
 
 # ------------------------------------------------------------------- place --
 
-def place_from_award(folder, root, ask_json, log):
+def place_from_award(folder, root, ask_json, log, found_awards=()):
     """District / Tehsil / Mouza from an award in this folder (or the folders above it, up to root):
-    its converted Excel file if there is one, else read from the award PDF. -> (place, source)"""
+    its converted Excel file if there is one, else read from the award PDF (named so, or found by
+    content: `found_awards`). -> (place, source)"""
     root = os.path.normpath(root)
     here = os.path.normpath(folder)
     while True:
@@ -96,7 +116,8 @@ def place_from_award(folder, root, ask_json, log):
                                     os.path.join(here, n))
                 except Exception:
                     pass
-        awards = [os.path.join(here, n) for n in names if award_batch.is_award(n)]
+        awards = [os.path.join(here, n) for n in names if award_batch.is_award(n)] or \
+            [a for a in found_awards if os.path.normpath(os.path.dirname(a)) == here]
         if awards:
             src = max(awards, key=award_batch.award_key)
             log(f"  reading District/Tehsil/Mouza from {os.path.basename(src)}")
@@ -135,15 +156,18 @@ def add_areas(areas):
     return (k, m, round(units - m * per, 2)), unit
 
 
-def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: False):
+def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: False, ask_json=None):
     """One mutation PDF -> {"rows", "totals" (one per mutation number), "issues", "missing", "unreadable",
-    "numbers", "pages"}. live(rows, page, pages) is called after each page with the table so far."""
+    "numbers", "pages"}. live(rows, page, pages) is called after each page with the table so far.
+    Each page is read cell by cell from its ruled grid; a page whose grid can't be found either way up is
+    read whole by the vision model (`ask_json`), and flagged."""
     doc = pymupdf.open(path)
     named = numbers_in_name(path)
     rows, subtotals, issues, totals_only = [], [], [], []
     expected = missing = failed = 0
     last_mut, last_khata = (named[0] if len(named) == 1 else ""), {}
     since_check = 0
+    footer_misses = 0  # pages whose footer had no total: after two, footers aren't read for this document
     reader, urdu = models
 
     def table():
@@ -163,7 +187,7 @@ def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: Fa
         for attempt in range(2):
             try:
                 res = mutation.read_page(doc[n], rot, ask, reader, urdu, lock=getattr(srv, "DOCS_LOCK", None),
-                                         plot_field="khasra", keep_totals=True)
+                                         plot_field="khasra", keep_totals=True, read_footer=footer_misses < 2)
             except Exception as e:
                 res = {"ok": False, "records": [], "error": f"{type(e).__name__}: {e}", "crashed": True}
             bad = res.get("crashed") or (res["ok"] and any(
@@ -172,9 +196,19 @@ def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: Fa
                 # No register grid: the scans in one document don't all face the same way, so try the
                 # page turned the other way round before giving up on it.
                 other = mutation.read_page(doc[n], (rot + 180) % 360, ask, reader, urdu,
-                                           lock=getattr(srv, "DOCS_LOCK", None), plot_field="khasra", keep_totals=True)
+                                           lock=getattr(srv, "DOCS_LOCK", None), plot_field="khasra", keep_totals=True,
+                                           read_footer=footer_misses < 2)
                 if other["ok"]:
                     res = other
+                elif ask_json:
+                    v = vision_page(doc[n], rot, ask_json)
+                    if v["ok"] and v["records"]:
+                        res = v
+                        issues.append(f"Page {n + 1}: no ruled grid found - read from the whole page instead; check "
+                                      "its rows against the scan")
+                        log(f"    page {n + 1}: no grid - read from the whole page")
+                    else:
+                        res = dict(res, error=f"no register grid found, and {v['error'] or 'nothing could be read from the whole page'}")
                 break
             if not bad or attempt:
                 break
@@ -192,6 +226,12 @@ def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: Fa
             mut = rec["award"] or last_mut
             if rec["award"]:
                 last_mut = rec["award"]
+            if rec.get("whole_khata") is not None and not rec["khasra_items"]:
+                # the whole khata changes hands and no khasra numbers are listed: one row says so, and its
+                # area is the khata's sub-total
+                plots = rec["whole_khata"]
+                label = "Whole khata" + (f" ({plots} plot{'s' if plots != 1 else ''})" if plots else "")
+                rec = dict(rec, khasra_items=[{"khasra": label, "area": ""}])
             if rec.get("total_only") or (not rec["khasra_items"] and rec["col17_total"] and not rec["khasra_only"]):
                 # a total with no khasras: maybe this mutation's grand total
                 totals_only.append((mut, rec["col17_total"], n + 1))
@@ -223,6 +263,12 @@ def read_document(path, srv, ask, models, place, log, live=None, stop=lambda: Fa
             for note in filter(None, (rec.get("notes") or "").split("; ")):
                 if not note.startswith("column 14"):
                     issues.append(f"Page {n + 1}: {note}")
+        if res.get("footer_total"):
+            # the total printed under the table (computer-printed form): this mutation's grand total
+            totals_only.append((last_mut, res["footer_total"], n + 1, "footer"))
+            footer_misses = -10 ** 6  # this document prints footer totals: keep reading them
+        elif res.get("footer_total") == "":
+            footer_misses += 1
         if live:
             live(table(), n + 1, doc.page_count)
 
@@ -244,9 +290,24 @@ def mutation_total(mut, subtotals, totals_only, issues):
     sub = [a for a in (_kms(s[2]) for s in subs) if a]
     sub_sum, unit = add_areas(sub) if sub else (None, "")
     label = f"Mutation {mut}" if mut else "The document"
+    footers = [t for t in totals_only if t[0] == mut and t[3:] == ("footer",) and _kms(t[1])]
+    if footers:
+        # The total printed under the table ("میزان کل رقبہ منتقلہ", the area transferred) is the mutation's
+        # total even when smaller than its khatas' areas. It repeats on every page: the most common reading
+        # wins over a stray misread (or a table cell caught in the footer crop).
+        votes = {}
+        for t in footers:
+            votes.setdefault(_kms(t[1]), []).append(t[2])
+        g, pages = max(votes.items(), key=lambda kv: (len(kv[1]), -kv[1][0]))
+        where = f"page {pages[0]}" if len(footers) == 1 else f"{len(pages)} of {len(footers)} pages, first page {pages[0]}"
+        if len(votes) > 1:
+            issues.append(f"{label}: the total under the table reads differently on some pages - "
+                          f"{fmt_kms(g)} taken (most pages); check")
+        return {"mut": mut, "total": g, "kind": f"total printed under the table ({where})", "subs": subs,
+                "unit": "Sq ft" if g[2] >= 9 else "Sarsai"}
     grands = [t for t in totals_only if t[0] == mut]
     if grands:
-        _m, area, page = grands[-1]
+        _m, area, page = grands[-1][:3]
         g = _kms(area)
         per = 272 if unit == "Sq ft" or (g and g[2] >= 9) else 9
         size = lambda a: a[0] * 20 * per + a[1] * per + a[2]  # noqa: E731
@@ -270,6 +331,90 @@ def heal(srv, models, log):
     if h["action"] != "none":
         log(f"    model check: {h['action']} - {h['detail']}")
     return h
+
+
+# ------------------------------------------------------- pages without a grid --
+
+VISION_SCHEMA = {"type": "object", "properties": {"entries": {"type": "array", "items": {"type": "object", "properties": {
+    "mutation_no": {"type": "string"}, "khata": {"type": "string"},
+    "khasras": {"type": "array", "items": {"type": "string"}},
+    "areas": {"type": "array", "items": {"type": "string"}}, "total": {"type": "string"}},
+    "required": ["mutation_no", "khata", "khasras", "areas", "total"]}}}, "required": ["entries"]}
+# No example values in the prompt: the model copies them into its answer when it can't read the page.
+VISION_PROMPT = (
+    "This is a page of a Pakistani land mutation register (Register Dakhil Kharij / Intiqal), a ruled form "
+    "in Urdu. Columns run right to left: the rightmost holds the mutation number, the next the khewat/khata "
+    "numbers; the leftmost two hold the khasra numbers (numbers joined by slashes) and the area of each "
+    "(three numbers joined by dashes: Kanal, Marla, Sarsai), sometimes ending with a total area. Transcribe "
+    "only what is written in those columns, for every entry on the page, as "
+    '{"entries": [{"mutation_no": "", "khata": "", "khasras": [], "areas": [], "total": ""}]}. '
+    "If you cannot read a value, leave it empty. Never guess, and never number the rows yourself.")
+
+
+def vision_page(page, rot, ask_json):
+    """A page whose ruled grid can't be found (handwritten, damaged, an unknown form): the vision model
+    reads the whole upright page into the same records as mutation.read_page, flagged for checking."""
+    z = 2000 / max(page.rect.width, page.rect.height)
+    png = page.get_pixmap(matrix=pymupdf.Matrix(z, z).prerotate(rot), alpha=False).tobytes("png")
+    try:
+        import json
+        entries = json.loads(ask_json(VISION_PROMPT, png, VISION_SCHEMA)).get("entries", [])[:12]
+    except Exception as e:
+        return {"ok": False, "records": [], "error": f"read without a grid failed ({type(e).__name__})"}
+    # An answer numbering its entries 1, 2, 3 ... as mutation numbers is the model counting rows, not
+    # reading them: the page couldn't be read.
+    muts = [str(e.get("mutation_no") or "").strip() for e in entries]
+    if len(muts) >= 3 and muts == [str(i) for i in range(1, len(muts) + 1)]:
+        return {"ok": False, "records": [], "error": "the page could not be read without its grid (handwritten or unclear)"}
+    records = []
+    for e in entries:
+        khasras = mutation.parse_khasra("\n".join(map(str, e.get("khasras") or []))).split(", ")
+        khasras = [k for k in khasras if k]
+        areas = mutation.KMS.findall(mutation._norm("\n".join(map(str, e.get("areas") or []))))
+        items, col17_total, _ = mutation.pair_khasra_areas(khasras, areas)
+        total = _kms(mutation._norm(e.get("total") or ""))
+        col17_total = col17_total or ("-".join(map(str, (total[0], total[1], _fmt3(total[2])))) if total else "")
+        mut = mutation.parse_award(e.get("mutation_no") or "")
+        nums = mutation._plain_numbers(e.get("khata") or "")
+        khata = re.sub(r"\s+", " ", str(e.get("khata") or "")).strip() if nums else ""
+        if not (mut or khata or items or col17_total):
+            continue
+        records.append({"award": mut, "khata": khata, "katat": ", ".join(khasras), "kanal": "", "marla": "",
+                        "sarsai": "", "continuation": False, "confidence": "low", "flags": ["vision"],
+                        "notes": "read from the whole page without its grid - check", "khasra_only": False,
+                        "total_only": not items and bool(col17_total) and not khata,
+                        "khasra_items": items, "col17_total": col17_total, "cells": {}})
+    return {"ok": True, "records": records, "error": "", "vision": True}
+
+
+# ---------------------------------------------------------- which documents --
+
+def classify(path, srv, log=lambda m: None):
+    """What a PDF is, by its name - or, for names that don't say (phone scans like "CamScanner ..."), by
+    its first pages: a register grid -> "mutation"; the word Award in its text -> "award"; else "other"."""
+    name = os.path.basename(path)
+    low = name.lower()
+    if "correction" in low:
+        return "other"
+    if is_mutation(name):
+        return "mutation"
+    if award_batch.is_award(name):
+        return "award"
+    try:
+        doc = pymupdf.open(path)
+        for n in range(min(2, doc.page_count)):
+            rot = srv.detect_orientation(doc, n)[0]
+            if mutation.locate_grid(doc[n], rot):
+                return "mutation"
+        cmd = srv.tesseract_cmd()
+        if cmd and doc.page_count:
+            p = doc[0]
+            png = p.get_pixmap(matrix=pymupdf.Matrix(200 / 72, 200 / 72), colorspace=pymupdf.csGRAY, alpha=False).tobytes("png")
+            if re.search(r"\baward\b", " ".join(w["text"] for w in award.tesseract(cmd, png, psm=3)), re.I):
+                return "award"
+    except Exception as e:
+        log(f"  could not check {name}: {e}")
+    return "other"
 
 
 # -------------------------------------------------------------------- word --
@@ -369,7 +514,10 @@ def write_outputs(path, res, place, place_src):
                      f"{fmt_kms(t)} ({mt['kind']}; third figure read as {mt['unit'] or 'Sarsai'})" if t else "not found"))
     info += [("Data missing (estimate)", f"{res['missing']:.0%}"),
              ("Extracted", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))]
-    issues = list(res["issues"])
+    counts = {}
+    for t in res["issues"]:  # the same note for many entries is listed once, with a count
+        counts[t] = counts.get(t, 0) + 1
+    issues = [t if c == 1 else f"{t} (x{c})" for t, c in counts.items()]
     if review:
         issues.insert(0, "REVIEW MANUALLY: " + "; ".join(reasons))
     if not place_src:
@@ -409,7 +557,6 @@ def run(srv, root, models, ask, ask_json, log, redo=False, stop=lambda: False, s
     ask_json(prompt, png, schema) reads the award's place names; live(doc, rows, page, pages) streams the
     table being built. -> {"done", "review", "skipped", "failed", "stopped"}"""
     groups = find_documents(root)
-    docs = [(folder, f) for folder, files in groups for f in files]
     fh = open(os.path.join(root, "Mutation Batch Log.txt"), "a", encoding="utf-8")
 
     def say(msg):
@@ -418,14 +565,32 @@ def run(srv, root, models, ask, ask_json, log, redo=False, stop=lambda: False, s
         fh.write(line + "\n")
         fh.flush()
 
-    say(f"=== Mutation batch over {root}: {len(docs)} mutation document(s) in {len(groups)} folder(s)")
+    unnamed = sum(len(u) for _f, _m, u in groups)
+    say(f"=== Mutation batch over {root}: {sum(len(m) for _f, m, _u in groups)} mutation document(s) by name"
+        + (f", {unnamed} other PDF(s) to check" if unnamed else "") + f" in {len(groups)} folder(s)")
     n = {"done": 0, "review": 0, "skipped": 0, "failed": 0, "stopped": False}
-    places = {}
+    places, found_awards, docs = {}, [], []
     try:
-        if docs:
+        if groups:
             h = heal(srv, list(models), say)  # start from healthy models
             if not h["ok"]:
                 say(f"!! The models are not reading correctly ({h['detail']}) - results may be incomplete")
+        for folder, files, others in groups:
+            docs += [(folder, f) for f in files]
+            for f in others:  # phone scans etc.: what they are is told from their pages
+                if stop():
+                    break
+                if not redo and is_done(f, os.listdir(folder)):
+                    docs.append((folder, f))  # converted before: skipped below without checking it again
+                    continue
+                kind = classify(f, srv, say)
+                say(f"{award_batch.folder_label(folder, root)}\\{os.path.basename(f)}: looks like "
+                    + {"mutation": "a mutation register", "award": "an award (used for District / Tehsil / Mouza)",
+                       "other": "neither - left alone"}[kind])
+                if kind == "mutation":
+                    docs.append((folder, f))
+                elif kind == "award":
+                    found_awards.append(f)
         for i, (folder, path) in enumerate(docs):
             if stop():
                 n["stopped"] = True
@@ -443,9 +608,9 @@ def run(srv, root, models, ask, ask_json, log, redo=False, stop=lambda: False, s
             t0 = time.time()
             try:
                 if folder not in places:
-                    places[folder] = place_from_award(folder, root, ask_json, say)
+                    places[folder] = place_from_award(folder, root, ask_json, say, found_awards)
                 place, src = places[folder]
-                res = read_document(path, srv, ask, models, place, say, stop=stop,
+                res = read_document(path, srv, ask, models, place, say, stop=stop, ask_json=ask_json,
                                     live=(lambda rows, p, pages: live(name, rows, p, pages)) if live else None)
                 xlsx, review, saved = write_outputs(path, res, place, src)
                 if live and saved:

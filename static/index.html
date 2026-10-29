@@ -163,7 +163,7 @@
     </div>
     <div class="hint for-table">Drag over the page to select the table region.</div>
     <div class="hint for-mutation" hidden>Open Register Dakhil Kharij pages (PDF or images). Each page's columns 1, 2, 14 and 17 are found and read by the local model; the cells it read are outlined on the page.</div>
-    <div class="hint for-mbatch" hidden>Mutation batch works on whole folders: pick a folder on the right. Every mutation PDF in it and its subfolders is read in turn (register pages, khasra list), and its table is built live on the right and saved next to the PDF. District / Tehsil / Mouza come from the award in the same folder.</div>
+    <div class="hint for-mbatch" hidden>Mutation batch works on whole folders: pick a folder on the right. Every mutation PDF in it and its subfolders (and any PDF whose name doesn't say, like phone scans, that turns out to be a register) is read in turn (register pages, khasra list), and its table is built live on the right and saved next to the PDF. District / Tehsil / Mouza come from the award in the same folder.</div>
     <div class="hint for-award" hidden>Open an award PDF and press Read award. The land table (Sqr. No / Khasra No. / K / M) is read page by page until its total; the square number is carried down and joined to each khasra.</div>
     <div class="hint for-translate" hidden>Drag over the page to select text. It is transcribed into “Original text” (fix any errors there), then translated. A paragraph or column at a time works best.</div>
     <div id="viewer">
@@ -1151,10 +1151,11 @@ $('#mbStart').onclick = async () => {
   try {
     const s = await api('/api/mutation/scan', { method: 'POST', body: JSON.stringify({ root }) });
     if (!s.ok) { status(s.error, true); return; }
-    if (!s.docs) { status('No mutation PDFs found in that folder or its subfolders.', true); return; }
-    const todo = $('#mbRedo').checked ? s.docs : s.docs - s.done;
-    if (!confirm(`${s.docs} mutation document${s.docs === 1 ? '' : 's'} found in ${s.folders} folder${s.folders === 1 ? '' : 's'}` +
-      `${s.done && !$('#mbRedo').checked ? ` (${s.done} already done, skipped)` : ''}. Convert ${todo} now?`)) return;
+    if (!s.docs && !s.other) { status('No mutation PDFs found in that folder or its subfolders.', true); return; }
+    const done = $('#mbRedo').checked ? 0 : s.done;
+    if (!confirm(`${s.docs} mutation document${s.docs === 1 ? '' : 's'} by name` +
+      `${s.other ? ` and ${s.other} other PDF${s.other === 1 ? '' : 's'} (e.g. phone scans) to check page by page` : ''}` +
+      ` in ${s.folders} folder${s.folders === 1 ? '' : 's'}${done ? ` (${done} already done, skipped)` : ''}. Start now?`)) return;
     await api('/api/mutation/batch/start', { method: 'POST', body: JSON.stringify({ root, model: $('#model').value, redo: $('#mbRedo').checked }) });
     mbPoll();
   } catch (e) { status(e.message, true); }

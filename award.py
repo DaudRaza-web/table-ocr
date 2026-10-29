@@ -221,8 +221,18 @@ def read_place(page, ask_json, rot=0):
         d = json.loads(ask_json(PLACE_PROMPT, png, PLACE_SCHEMA))
     except (ValueError, TypeError):
         return {}
-    return {"district": d.get("district", "").strip(), "tehsil": d.get("tehsil", "").strip(),
-            "mouza": d.get("locality", "").strip()}
+    return {k: v for k, v in (("district", d.get("district", "").strip()), ("tehsil", d.get("tehsil", "").strip()),
+                              ("mouza", d.get("locality", "").strip())) if looks_like_name(v)}
+
+
+_NOT_NAME = re.compile(r"\b(?:the|by|of|and|for|was|were|is|to|in|as|per|on|with|under|land|area|total|"
+                       r"project|issued|collector)\b", re.I)
+
+
+def looks_like_name(v):
+    """A place name, not a fragment of the body text (the crop left of some other table on the page:
+    "issued by", "The lan", "project t")."""
+    return bool(v) and not _NOT_NAME.search(v) and not re.match(r"[a-z]", v)
 
 
 DOC_PLACE_PROMPT = ("This is the first page of a land acquisition award. Find the district, the tehsil and the "
